@@ -1,0 +1,23 @@
+[package]
+name = "drainage"
+version = "0.1.0"
+edition = "2021"
+description = "Track the drifting exchange rate between tokens spent and AI-subscription usage-limit consumed"
+license = "MIT"
+repository = "https://github.com/krak7602/drainage"
+readme = "README.md"
+keywords = ["claude", "codex", "tui", "usage", "tokens"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+walkdir = "2"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+opt-level = 2
