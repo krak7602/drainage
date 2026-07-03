@@ -1,6 +1,7 @@
 mod analysis;
 mod collect;
 mod data;
+mod levels;
 mod model;
 mod sources;
 mod tui;
@@ -114,16 +115,15 @@ fn scan() -> Result<()> {
     println!();
 
     println!("exchange rate PER MODEL  (Δ window-% per 1M weighted tokens; cache-reads excluded)");
-    println!("  single-model = intervals a model dominated (trusted) · nnls = decomposed incl.");
-    println!("  mixed (experimental: util% is ~1%-quantized, which biases per-interval NNLS low)");
+    println!("  single = intervals a model dominated · levels = per-epoch levels-NNLS + Kalman");
     let mut any = false;
     for provider in d.providers() {
         for window in [Window::FiveHour, Window::SevenDay] {
             let mut header_done = false;
             for model in d.models(&provider) {
                 let single = d.model_rate(&provider, &model, window, Method::Single);
-                let nnls = d.model_rate(&provider, &model, window, Method::Nnls);
-                if single.is_none() && nnls.is_none() {
+                let levels = d.model_rate(&provider, &model, window, Method::Levels);
+                if single.is_none() && levels.is_none() {
                     continue;
                 }
                 any = true;
@@ -133,24 +133,15 @@ fn scan() -> Result<()> {
                 }
                 let s = single
                     .map(|(r, n)| format!("single {r:>6.2} (n={n})"))
-                    .unwrap_or_else(|| "single    —    ".into());
-                let nn = nnls
-                    .map(|(r, _)| format!("nnls {r:>6.2}"))
-                    .unwrap_or_else(|| "nnls   — ".into());
+                    .unwrap_or_else(|| "single    —       ".into());
+                let lv = levels
+                    .map(|(r, k)| format!("levels {r:>6.2} ({k} epochs)"))
+                    .unwrap_or_else(|| "levels   —".into());
                 let drift = d
-                    .model_drift_summary(&provider, &model, window, Method::Single)
+                    .model_drift_summary(&provider, &model, window, Method::Levels)
                     .map(|(r, o, c)| format!("   drift {o:.2}→{r:.2} ({c:+.0}%)"))
                     .unwrap_or_default();
-                println!("      {:<22} {s}  |  {nn} %/Mtok{drift}", truncate(&model, 22));
-            }
-            if header_done {
-                let (attr, mixed) = d.attribution_coverage(&provider, window);
-                if attr + mixed > 0.0 && mixed > 0.0 {
-                    println!(
-                        "      (single-model leaves {:.0}% of spend unattributed; nnls uses it)",
-                        mixed / (attr + mixed) * 100.0
-                    );
-                }
+                println!("      {:<22} {s}  |  {lv} %/Mtok{drift}", truncate(&model, 22));
             }
         }
     }

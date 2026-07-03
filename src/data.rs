@@ -17,20 +17,24 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum Method {
     /// Stage 1: only intervals a model dominated (≥90% of spend). Transparent.
     Single,
-    /// Stage 2: non-negative least squares over all intervals, incl. mixed ones.
+    /// Stage 2: non-negative least squares over per-interval deltas (mixed too).
     Nnls,
+    /// Stage 3: per-epoch levels-NNLS + Kalman smoothing. Robust to quantization.
+    Levels,
 }
 
 impl Method {
     pub fn label(&self) -> &'static str {
         match self {
             Method::Single => "single-model",
-            Method::Nnls => "NNLS",
+            Method::Nnls => "NNLS-delta",
+            Method::Levels => "levels+Kalman",
         }
     }
     pub fn toggle(&self) -> Method {
         match self {
-            Method::Single => Method::Nnls,
+            Method::Single => Method::Levels,
+            Method::Levels => Method::Nnls,
             Method::Nnls => Method::Single,
         }
     }
@@ -181,6 +185,10 @@ impl Dataset {
                 }
                 self.nnls_over(&ivs).get(model).map(|&r| (r, ivs.len()))
             }
+            Method::Levels => {
+                let series = self.levels_series(provider, model, window);
+                series.last().map(|&(_, r)| (r, series.len()))
+            }
         }
     }
 
@@ -213,6 +221,17 @@ impl Dataset {
                 out
             }
             Method::Nnls => self.nnls_series_all(provider, window).remove(model).unwrap_or_default(),
+            Method::Levels => self.levels_series(provider, model, window),
+        }
+    }
+
+    /// Stage-3 estimate for one model+window: per-epoch levels-NNLS measurements,
+    /// Kalman-smoothed into a drift trajectory.
+    fn levels_series(&self, provider: &Provider, model: &str, window: Window) -> Vec<(f64, f64)> {
+        let meas = crate::levels::epoch_rates(&self.events, &self.snaps, provider, window, &self.weights);
+        match meas.get(model) {
+            Some(points) => crate::levels::kalman(points),
+            None => Vec::new(),
         }
     }
 

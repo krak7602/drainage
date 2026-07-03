@@ -42,11 +42,11 @@ Then just use Claude Code as normal. Snapshots accumulate at `~/.drainage/claude
 
 Between two utilization snapshots, the window's used-% moved by Δ. drainage attributes that to the tokens spent in the interval and reports **Δ% per 1M weighted tokens** — the exchange rate. Then it tracks how that number drifts.
 
-**The rate is strictly per-model.** Opus consumes far more of a window per token than Sonnet, so a rate pooled across models just measures your model *mix*, not anything real. Every interval stores its full per-model token vector, and rates are reported per (account, model, window) — never pooled. This is the same decomposition used in hedonic regression, spectral unmixing, and energy disaggregation (NILM), and it's built in stages:
+**The rate is strictly per-model.** Opus consumes far more of a window per token than Sonnet, so a rate pooled across models just measures your model *mix*, not anything real. Rates are reported per (account, model, window) — never pooled. This is the same decomposition used in hedonic regression, spectral unmixing, and energy disaggregation (NILM). Three estimators are built in (toggle with `m`):
 
-1. **Single-model attribution** *(current)* — a model's rate comes from intervals where it was ≥90% of spend; mixed intervals are reported as an "unattributed %".
-2. **NNLS over rolling windows** — decompose mixed intervals too (non-negative least squares).
-3. **Time-varying / Kalman filter** — track each model's rate as a state that drifts, the rigorous form.
+1. **Single-model** — a model's rate from intervals where it was ≥90% of spend. Transparent, but biased *high*: utilization % is ~1%-quantized, so a short interval only registers when a tiny spend crosses a 1% boundary, overstating the rate.
+2. **NNLS-delta** — non-negative least squares over per-interval deltas; decomposes mixed intervals but inherits the same quantization bias.
+3. **levels + Kalman** *(default)* — the fix. The windows are fixed-reset epochs where used% accumulates, so instead of *differencing* the quantized signal, we regress its **levels**: within each epoch, `used%(t) = Σ_model rate_model · cumulative_tokens_model(t)`, a non-negative through-origin fit. Quantization becomes ±0.5 noise over ~20 observations per epoch. Each epoch yields one robust rate; a scalar **Kalman filter** over the epoch sequence tracks the drift.
 
 Guards against false drift:
 

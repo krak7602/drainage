@@ -48,8 +48,10 @@ pub fn run() -> Result<()> {
     let mut app = App {
         data,
         tab: 0,
-        window: Window::SevenDay,
-        method: Method::Single,
+        // 5h has many more reset-epochs than 7d today, so its levels estimate is
+        // the strongest signal; levels+Kalman is the most accurate estimator.
+        window: Window::FiveHour,
+        method: Method::Levels,
         last_reload: Instant::now(),
         loaded_ago: Instant::now(),
     };
@@ -505,7 +507,7 @@ mod tests {
         };
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("term");
-        for method in [Method::Single, Method::Nnls] {
+        for method in [Method::Single, Method::Nnls, Method::Levels] {
             app.method = method;
             for w in [Window::FiveHour, Window::SevenDay] {
                 app.window = w;
