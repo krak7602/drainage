@@ -40,12 +40,18 @@ Then just use Claude Code as normal. Snapshots accumulate at `~/.drainage/claude
 
 ## How the measurement works
 
-Between two utilization snapshots, the window's used-% moved by Δ. drainage attributes that to the **weighted** tokens spent in the interval and reports **Δ% per 1M weighted tokens** — the exchange rate. Then it tracks how that number drifts.
+Between two utilization snapshots, the window's used-% moved by Δ. drainage attributes that to the tokens spent in the interval and reports **Δ% per 1M weighted tokens** — the exchange rate. Then it tracks how that number drifts.
+
+**The rate is strictly per-model.** Opus consumes far more of a window per token than Sonnet, so a rate pooled across models just measures your model *mix*, not anything real. Every interval stores its full per-model token vector, and rates are reported per (account, model, window) — never pooled. This is the same decomposition used in hedonic regression, spectral unmixing, and energy disaggregation (NILM), and it's built in stages:
+
+1. **Single-model attribution** *(current)* — a model's rate comes from intervals where it was ≥90% of spend; mixed intervals are reported as an "unattributed %".
+2. **NNLS over rolling windows** — decompose mixed intervals too (non-negative least squares).
+3. **Time-varying / Kalman filter** — track each model's rate as a state that drifts, the rigorous form.
 
 Guards against false drift:
 
 - **Account-scoped windows.** Limits are scoped to the *subscription account*, not the tool. Claude Code and omp-on-Anthropic pool against one Anthropic window; Codex and omp-on-OpenAI pool against the OpenAI window.
-- **Token weighting.** Output ≈ 5× input, cache reads ≈ free, cache writes a bit above input. Weights are a *transparent assumption* you can calibrate — a change in your cache-hit rate shouldn't look like rate drift.
+- **Token weighting.** Output ≈ 5× input, cache writes a bit above input, and **cache reads are excluded** (≈ free against the limit) — so a change in your cache-hit rate doesn't look like rate drift. Weights are a transparent assumption you can calibrate.
 - **Decay skipping.** The 5h window is rolling; intervals where it was draining (not filling) are excluded.
 
 ## Honest caveats
