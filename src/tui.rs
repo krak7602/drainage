@@ -4,7 +4,7 @@
 //! long?). Reloads from disk every few seconds so it tracks live usage.
 
 use crate::analysis::Window;
-use crate::data::{Dataset as Data, Method};
+use crate::data::{Confidence, Dataset as Data, Method};
 use crate::model::{Provider, Weights};
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -120,6 +120,14 @@ fn short_model(m: &str) -> String {
     s.to_string()
 }
 
+fn conf_glyph(c: Confidence) -> (&'static str, Color) {
+    match c {
+        Confidence::High => ("●●●", Color::Green),
+        Confidence::Medium => ("●●○", Color::Yellow),
+        Confidence::Low => ("●○○", Color::Red),
+    }
+}
+
 fn human(n: f64) -> String {
     if n >= 1e9 {
         format!("{:.2}B", n / 1e9)
@@ -224,9 +232,19 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
     for (idx, model) in models.iter().enumerate() {
         let color = PALETTE[idx % PALETTE.len()];
         let short = short_model(model);
+        let Some(est) = app.data.rate_estimate(&p, model, win, app.method) else {
+            continue;
+        };
+        any = true;
+        let (g, gc) = conf_glyph(est.confidence());
+        let pm = est.std.map(|s| format!(" ±{s:.1}")).unwrap_or_default();
+        let mut spans = vec![
+            Span::styled(format!("  {short:14} "), Style::new().fg(color).bold()),
+            Span::raw(format!("{:.2}{pm} ", est.rate)),
+            Span::styled(g, Style::new().fg(gc)),
+        ];
         match app.data.model_drift_summary(&p, model, win, app.method) {
-            Some((recent, older, change)) => {
-                any = true;
+            Some((_, older, change)) => {
                 let (arrow, vcolor, verdict) = if change > 2.0 {
                     ("▲", Color::Red, "worse")
                 } else if change < -2.0 {
@@ -234,22 +252,15 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     ("≈", Color::Yellow, "stable")
                 };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {short:14} "), Style::new().fg(color).bold()),
-                    Span::raw(format!("now {recent:.2}  vs {older:.2}   ")),
-                    Span::styled(format!("{arrow} {change:+.0}% {verdict}"), Style::new().fg(vcolor).bold()),
-                ]));
+                spans.push(Span::raw(format!("   vs {older:.2}  ")));
+                spans.push(Span::styled(format!("{arrow} {change:+.0}% {verdict}"), Style::new().fg(vcolor).bold()));
             }
-            None => {
-                if let Some((rate, n)) = app.data.model_rate(&p, model, win, app.method) {
-                    any = true;
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {short:14} "), Style::new().fg(color).bold()),
-                        Span::raw(format!("{rate:.2} %/Mtok  (n={n}, need ≥2 days for drift)")),
-                    ]));
-                }
-            }
+            None => spans.push(Span::styled(
+                format!("  (n={}, more data → drift)", est.n),
+                Style::new().fg(Color::DarkGray),
+            )),
         }
+        lines.push(Line::from(spans));
     }
     if !any {
         lines.push(Line::from(Span::styled(
@@ -346,18 +357,24 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
 fn draw_attr(f: &mut Frame, app: &App, area: Rect) {
     let win = app.window;
     let rows = app.data.by_model();
-    // Look up each model's current-window rate; find the max for highlighting.
-    let rate_of =
-        |r: &crate::data::ModelRow| app.data.model_rate(&r.provider, &r.model, win, app.method).map(|(v, _)| v);
-    let max_rate = rows.iter().filter_map(rate_of).fold(0.0_f64, f64::max);
+    let est_of = |r: &crate::data::ModelRow| app.data.rate_estimate(&r.provider, &r.model, win, app.method);
+    let max_rate = rows
+        .iter()
+        .filter_map(|r| est_of(r).map(|e| e.rate))
+        .fold(0.0_f64, f64::max);
 
-    let header = Row::new(vec!["harness", "model", "weighted", "output", "calls", "%/Mtok"])
+    let header = Row::new(vec!["harness", "model", "weighted", "%/Mtok", "conf"])
         .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     let body: Vec<Row> = rows
         .iter()
         .map(|r| {
-            let rate = rate_of(r);
+            let est = est_of(r);
+            let rate = est.as_ref().map(|e| e.rate);
             let rate_s = rate.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into());
+            let (glyph, gc) = est
+                .as_ref()
+                .map(|e| conf_glyph(e.confidence()))
+                .unwrap_or(("", Color::DarkGray));
             let style = if rate.map(|v| v >= max_rate && max_rate > 0.0).unwrap_or(false) {
                 Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
             } else {
@@ -367,9 +384,8 @@ fn draw_attr(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(r.harness.to_string()),
                 Cell::from(short_model(&r.model)),
                 Cell::from(human(r.weighted)),
-                Cell::from(human(r.output as f64)),
-                Cell::from(r.calls.to_string()),
                 Cell::from(rate_s),
+                Cell::from(Span::styled(glyph, Style::new().fg(gc))),
             ])
             .style(style)
         })
@@ -380,10 +396,9 @@ fn draw_attr(f: &mut Frame, app: &App, area: Rect) {
         [
             Constraint::Length(12),
             Constraint::Min(16),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(8),
+            Constraint::Length(12),
             Constraint::Length(9),
+            Constraint::Length(6),
         ],
     )
     .header(header)

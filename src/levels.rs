@@ -125,12 +125,80 @@ pub fn epoch_rates(
     out
 }
 
+/// Calibrate token-type weights from data: regress used% LEVELS on cumulative
+/// RAW tokens of each type (input / output / cacheRead / cacheWrite), pooled
+/// across epochs (all pass through the origin at reset). Returns the fitted
+/// per-type cost `[input, output, cache_read, cache_write]` in %/Mtok, plus the
+/// epoch and observation counts. This measures the *real* weights — e.g. whether
+/// output really costs ~5× input and whether cache reads are ~free.
+pub fn calibrate(
+    events: &[TokenEvent],
+    snaps: &[UtilSnapshot],
+    provider: &Provider,
+    window: Window,
+) -> Option<([f64; 4], usize, usize)> {
+    let wsecs = window_secs(window);
+    let mut pevents: Vec<&TokenEvent> = events
+        .iter()
+        .filter(|e| &e.provider == provider && e.ts > 0)
+        .collect();
+    pevents.sort_by_key(|e| e.ts);
+
+    let mut epochs: BTreeMap<i64, Vec<&UtilSnapshot>> = BTreeMap::new();
+    for s in snaps
+        .iter()
+        .filter(|s| &s.provider == provider && used(s, window).is_some() && reset(s, window).is_some())
+    {
+        epochs.entry(reset(s, window).unwrap()).or_default().push(s);
+    }
+
+    let mut rows: Vec<(Vec<f64>, f64)> = Vec::new();
+    let mut n_epochs = 0;
+    for (reset_at, mut group) in epochs {
+        if group.len() < 3 {
+            continue;
+        }
+        group.sort_by_key(|s| s.ts);
+        let epoch_start = reset_at - wsecs;
+        let ev: Vec<&TokenEvent> = pevents
+            .iter()
+            .copied()
+            .filter(|e| e.ts > epoch_start && e.ts <= reset_at)
+            .collect();
+        if ev.is_empty() {
+            continue;
+        }
+        if group.iter().filter_map(|s| used(s, window)).fold(0.0, f64::max) < 2.0 {
+            continue;
+        }
+        n_epochs += 1;
+        for s in &group {
+            let u = used(s, window).unwrap();
+            let mut cum = [0.0f64; 4];
+            for e in &ev {
+                if e.ts <= s.ts {
+                    cum[0] += e.input as f64;
+                    cum[1] += e.output as f64;
+                    cum[2] += e.cache_read as f64;
+                    cum[3] += e.cache_write as f64;
+                }
+            }
+            rows.push((vec![cum[0] / 1e6, cum[1] / 1e6, cum[2] / 1e6, cum[3] / 1e6], u));
+        }
+    }
+    if rows.len() < 8 || n_epochs == 0 {
+        return None;
+    }
+    let x = nnls(4, &rows, 1e-6);
+    Some(([x[0], x[1], x[2], x[3]], n_epochs, rows.len()))
+}
+
 /// Scalar Kalman filter over one model's epoch-rate measurements. State = the
 /// (slowly drifting) true rate; random-walk process. Returns the filtered
-/// trajectory (epoch end ts, smoothed rate). `q`/`r` are deliberately simple,
-/// tunable constants: `q` allows drift between epochs, measurement variance
-/// shrinks with the number of observations backing an epoch estimate.
-pub fn kalman(meas: &[EpochPoint]) -> Vec<(f64, f64)> {
+/// trajectory as (epoch end ts, smoothed rate, posterior variance). `Q`/`R` are
+/// deliberately simple, tunable constants: `Q` allows drift between epochs,
+/// measurement variance shrinks with the number of observations per epoch.
+pub fn kalman(meas: &[EpochPoint]) -> Vec<(f64, f64, f64)> {
     if meas.is_empty() {
         return Vec::new();
     }
@@ -145,7 +213,7 @@ pub fn kalman(meas: &[EpochPoint]) -> Vec<(f64, f64)> {
         let k = p / (p + r); // Kalman gain
         x += k * (z - x); // update
         p *= 1.0 - k;
-        out.push((t as f64, x));
+        out.push((t as f64, x, p));
     }
     out
 }

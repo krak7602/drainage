@@ -43,6 +43,48 @@ impl Method {
 /// Rolling window used to estimate a time-local NNLS fit for drift.
 const NNLS_WINDOW_SECS: i64 = 3 * 86_400;
 
+/// A rate estimate with its sample size and (where available) an uncertainty.
+pub struct RateEstimate {
+    pub rate: f64,
+    pub n: usize,
+    /// ±1σ uncertainty in %/Mtok (Kalman posterior std, or single-model stderr).
+    pub std: Option<f64>,
+}
+
+/// Qualitative confidence, for a compact UI glyph.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl RateEstimate {
+    pub fn confidence(&self) -> Confidence {
+        // Relative uncertainty dominates when known; otherwise fall back to n.
+        let rel = self.std.map(|s| if self.rate > 0.0 { s / self.rate } else { 1.0 });
+        match rel {
+            Some(r) if self.n >= 6 && r < 0.20 => Confidence::High,
+            Some(r) if self.n >= 3 && r < 0.40 => Confidence::Medium,
+            Some(_) => Confidence::Low,
+            None if self.n >= 12 => Confidence::High,
+            None if self.n >= 4 => Confidence::Medium,
+            None => Confidence::Low,
+        }
+    }
+}
+
+/// Standard error of the mean (std ÷ √n) for n ≥ 2, else None.
+fn stderr(xs: &[f64]) -> Option<f64> {
+    let n = xs.len();
+    if n < 2 {
+        return None;
+    }
+    let mean = xs.iter().sum::<f64>() / n as f64;
+    let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+    Some((var / n as f64).sqrt())
+}
+
 pub struct ModelRow {
     pub harness: Harness,
     pub provider: Provider,
@@ -157,7 +199,7 @@ impl Dataset {
     }
 
     /// Exchange rate for one model+window under the chosen method.
-    /// Returns (rate %/Mtok, n_intervals the estimate rests on).
+    /// Returns (rate %/Mtok, n the estimate rests on).
     pub fn model_rate(
         &self,
         provider: &Provider,
@@ -165,29 +207,54 @@ impl Dataset {
         window: Window,
         method: Method,
     ) -> Option<(f64, usize)> {
+        self.rate_estimate(provider, model, window, method)
+            .map(|e| (e.rate, e.n))
+    }
+
+    /// Rate plus its sample size and (where computable) an uncertainty ±std, so
+    /// the UI can show how much to trust the number.
+    pub fn rate_estimate(
+        &self,
+        provider: &Provider,
+        model: &str,
+        window: Window,
+        method: Method,
+    ) -> Option<RateEstimate> {
         match method {
             Method::Single => {
-                let mut rates: Vec<f64> = self
+                let rates: Vec<f64> = self
                     .single_model_intervals(provider, model, window)
                     .map(|i| i.delta_pct / (i.total_weighted / 1_000_000.0))
                     .collect();
                 if rates.is_empty() {
-                    None
-                } else {
-                    let n = rates.len();
-                    Some((median(&mut rates), n))
+                    return None;
                 }
+                let n = rates.len();
+                let mut sorted = rates.clone();
+                Some(RateEstimate {
+                    rate: median(&mut sorted),
+                    n,
+                    std: stderr(&rates),
+                })
             }
             Method::Nnls => {
                 let ivs = self.window_intervals(provider, window);
                 if ivs.is_empty() {
                     return None;
                 }
-                self.nnls_over(&ivs).get(model).map(|&r| (r, ivs.len()))
+                self.nnls_over(&ivs).get(model).map(|&r| RateEstimate {
+                    rate: r,
+                    n: ivs.len(),
+                    std: None,
+                })
             }
             Method::Levels => {
-                let series = self.levels_series(provider, model, window);
-                series.last().map(|&(_, r)| (r, series.len()))
+                let f = self.levels_filtered(provider, model, window);
+                f.last().map(|&(_, x, p)| RateEstimate {
+                    rate: x,
+                    n: f.len(),
+                    std: Some(p.max(0.0).sqrt()),
+                })
             }
         }
     }
@@ -226,8 +293,16 @@ impl Dataset {
     }
 
     /// Stage-3 estimate for one model+window: per-epoch levels-NNLS measurements,
-    /// Kalman-smoothed into a drift trajectory.
+    /// Kalman-smoothed into a drift trajectory (ts, rate).
     fn levels_series(&self, provider: &Provider, model: &str, window: Window) -> Vec<(f64, f64)> {
+        self.levels_filtered(provider, model, window)
+            .into_iter()
+            .map(|(t, x, _)| (t, x))
+            .collect()
+    }
+
+    /// Full Kalman output incl. posterior variance (ts, rate, variance).
+    fn levels_filtered(&self, provider: &Provider, model: &str, window: Window) -> Vec<(f64, f64, f64)> {
         let meas = crate::levels::epoch_rates(&self.events, &self.snaps, provider, window, &self.weights);
         match meas.get(model) {
             Some(points) => crate::levels::kalman(points),

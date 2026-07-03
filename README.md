@@ -5,10 +5,15 @@
 Per token, the share of your 5-hour / 7-day limit that gets consumed is **not constant**. It varies with the model (Opus burns far more of your window than Sonnet), your cache-hit rate, provider policy changes, and rate-card updates. For the *same* person on the *same* subscription, the rate drifts week to week. drainage measures that drift — locally, from data your coding agents already write to disk.
 
 ```
-drainage          # interactive TUI (Drift · Attribution · Budget)
-drainage scan     # one-shot text report
-drainage init     # install the collector into your Claude Code statusline
+drainage           # interactive TUI (Drift · Attribution · Budget)
+drainage scan      # one-shot text report
+drainage calibrate # measure your real token-type weights from data
+drainage init      # install the collector into your Claude Code statusline
 ```
+
+Estimates carry a confidence glyph (●●● / ●●○ / ●○○) from sample size and Kalman
+uncertainty, and the levels estimate shows ±σ, so you can see how much to trust
+a number while data is still thin.
 
 ## Why this is hard (and how drainage does it)
 

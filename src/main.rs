@@ -26,6 +26,8 @@ enum Cmd {
     Tui,
     /// Read all local data and print an exchange-rate report.
     Scan,
+    /// Measure real token-type weights (output vs input vs cache) from your data.
+    Calibrate,
     /// Install the drainage collector into your Claude Code statusline.
     Init,
     /// Remove the drainage collector and restore your original statusline.
@@ -40,6 +42,7 @@ fn main() -> Result<()> {
     match cli.cmd.unwrap_or(Cmd::Tui) {
         Cmd::Tui => tui::run(),
         Cmd::Scan => scan(),
+        Cmd::Calibrate => calibrate(),
         Cmd::Init => collect::init(),
         Cmd::Uninstall => collect::uninstall(),
         Cmd::Statusline => collect::statusline(),
@@ -158,6 +161,52 @@ fn scan() -> Result<()> {
     println!();
     println!("note: utilization is account-global; spend from claude.ai chat or other");
     println!("      sessions on the same account is invisible here and adds noise.");
+    Ok(())
+}
+
+fn calibrate() -> Result<()> {
+    let d = Dataset::load(Weights::default())?;
+    let assumed = Weights::default();
+    println!("\x1b[1mdrainage calibrate\x1b[0m  — measured token-type weights vs assumed");
+    println!("─────────────────────────────────────────────");
+    println!("levels regression of used% on cumulative RAW tokens per type\n");
+
+    let Some(provider) = d.providers().into_iter().next() else {
+        println!("no utilization data yet — keep using your agents.");
+        return Ok(());
+    };
+
+    let mut printed = false;
+    for window in [Window::FiveHour, Window::SevenDay] {
+        let Some((c, epochs, obs)) = levels::calibrate(&d.events, &d.snaps, &provider, window) else {
+            continue;
+        };
+        printed = true;
+        println!("{provider} [{}]  ({epochs} epochs, {obs} observations)", window.label());
+        // A collapsed input coefficient (too few epochs / collinearity) makes the
+        // normalization meaningless — flag rather than print misleading weights.
+        if epochs < 4 || c[0] < 0.01 {
+            println!("  not enough independent signal to calibrate this window yet.\n");
+            continue;
+        }
+        let base = c[0];
+        println!("  cost of 1M input tokens ≈ {:.2}% of the {} window\n", c[0], window.label());
+        println!("  {:<13} {:>10} {:>10}", "type", "measured", "assumed");
+        let row = |name: &str, meas: f64, asmd: f64| {
+            println!("  {name:<13} {:>10} {:>10}", format!("{:.2}", meas / base), format!("{asmd:.2}"));
+        };
+        row("input", c[0], assumed.input);
+        row("output", c[1], assumed.output);
+        row("cache_write", c[3], assumed.cache_write);
+        row("cache_read", c[2], assumed.cache_read);
+        println!();
+    }
+    if !printed {
+        println!("not enough epochs yet to calibrate (need a few reset cycles of usage).");
+    } else {
+        println!("weights are relative to input=1. Token types are correlated, so a wobbly");
+        println!("coefficient (esp. cache_read) usually means collinearity, not a real cost.");
+    }
     Ok(())
 }
 
