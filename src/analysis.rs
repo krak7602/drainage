@@ -154,3 +154,87 @@ pub fn day_key(ts: i64) -> String {
         .map(|dt| dt.format("%Y-%m-%d").to_string())
         .unwrap_or_else(|| "????-??-??".to_string())
 }
+
+/// Non-negative least squares by coordinate descent: minimize ‖Ax − b‖² s.t.
+/// x ≥ 0. This is the stage-2 decomposition — it recovers each model's rate
+/// even from mixed intervals, as long as the model mix varies across rows.
+///
+/// Coordinate descent on the convex QP ½xᵀ(AᵀA)x − (Aᵀb)ᵀx with x ≥ 0 is
+/// guaranteed to converge and needs no matrix inversion — ideal for the handful
+/// of model-columns we have. `rows` are (design_row of length `ncols`, target).
+/// `ridge_rel` adds a small relative diagonal term for numerical stability under
+/// collinearity.
+pub fn nnls(ncols: usize, rows: &[(Vec<f64>, f64)], ridge_rel: f64) -> Vec<f64> {
+    if ncols == 0 {
+        return Vec::new();
+    }
+    // Normal equations AᵀA (ncols×ncols) and Aᵀb (ncols).
+    let mut ata = vec![vec![0.0f64; ncols]; ncols];
+    let mut atb = vec![0.0f64; ncols];
+    for (row, y) in rows {
+        for j in 0..ncols {
+            if row[j] == 0.0 {
+                continue;
+            }
+            atb[j] += row[j] * y;
+            for k in 0..ncols {
+                ata[j][k] += row[j] * row[k];
+            }
+        }
+    }
+    for (j, row) in ata.iter_mut().enumerate() {
+        row[j] += ridge_rel * row[j].max(1e-12);
+    }
+
+    let mut x = vec![0.0f64; ncols];
+    for _ in 0..1000 {
+        let mut max_delta = 0.0f64;
+        for j in 0..ncols {
+            if ata[j][j] <= 0.0 {
+                continue;
+            }
+            let dot: f64 = (0..ncols).map(|k| ata[j][k] * x[k]).sum();
+            // Move coordinate j to its optimum with the others fixed, clamp ≥ 0.
+            let numerator = atb[j] - dot + ata[j][j] * x[j];
+            let new = (numerator / ata[j][j]).max(0.0);
+            max_delta = max_delta.max((new - x[j]).abs());
+            x[j] = new;
+        }
+        if max_delta < 1e-9 {
+            break;
+        }
+    }
+    x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nnls;
+
+    #[test]
+    fn recovers_rates_from_mixed_intervals() {
+        // Two models with true rates opus=30, sonnet=6 %/Mtok. No pure interval.
+        let rows = vec![
+            (vec![0.8, 0.2], 25.2), // 0.8·30 + 0.2·6
+            (vec![0.3, 0.7], 13.2), // 0.3·30 + 0.7·6
+            (vec![0.6, 0.4], 20.4),
+            (vec![0.5, 0.5], 18.0),
+        ];
+        let x = nnls(2, &rows, 1e-9);
+        assert!((x[0] - 30.0).abs() < 0.5, "opus: {}", x[0]);
+        assert!((x[1] - 6.0).abs() < 0.5, "sonnet: {}", x[1]);
+    }
+
+    #[test]
+    fn clamps_negative_to_zero() {
+        // A model whose OLS coefficient would be negative must clamp to 0.
+        let rows = vec![
+            (vec![1.0, 1.0], 10.0),
+            (vec![1.0, 2.0], 9.0), // adding the 2nd model *reduces* target → OLS<0
+            (vec![1.0, 3.0], 8.0),
+        ];
+        let x = nnls(2, &rows, 1e-9);
+        assert!(x[0] >= 0.0 && x[1] >= 0.0, "non-negative: {x:?}");
+        assert!((x[1]).abs() < 1e-6, "2nd model clamped to 0: {}", x[1]);
+    }
+}

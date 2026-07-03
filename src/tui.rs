@@ -4,7 +4,7 @@
 //! long?). Reloads from disk every few seconds so it tracks live usage.
 
 use crate::analysis::Window;
-use crate::data::Dataset as Data;
+use crate::data::{Dataset as Data, Method};
 use crate::model::{Provider, Weights};
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -38,6 +38,7 @@ struct App {
     data: Data,
     tab: usize,
     window: Window,
+    method: Method,
     last_reload: Instant,
     loaded_ago: Instant,
 }
@@ -48,6 +49,7 @@ pub fn run() -> Result<()> {
         data,
         tab: 0,
         window: Window::SevenDay,
+        method: Method::Single,
         last_reload: Instant::now(),
         loaded_ago: Instant::now(),
     };
@@ -68,6 +70,7 @@ pub fn run() -> Result<()> {
                         KeyCode::Tab | KeyCode::Right => app.tab = (app.tab + 1) % 3,
                         KeyCode::Left => app.tab = (app.tab + 2) % 3,
                         KeyCode::Char('w') => app.window = app.window.other(),
+                        KeyCode::Char('m') => app.method = app.method.toggle(),
                         KeyCode::Char('r') => reload(&mut app),
                         _ => {}
                     }
@@ -169,7 +172,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or((0.0, 0.0));
     let title = Line::from(vec![
         Span::styled(" drainage ", Style::new().bold().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(format!("  {p} 5h:{five:.0}%  7d:{week:.0}%  ·  window: {}", app.window.label())),
+        Span::raw(format!(
+            "  {p} 5h:{five:.0}%  7d:{week:.0}%  ·  window: {}  ·  method: {}",
+            app.window.label(),
+            app.method.label()
+        )),
     ]);
     let tabs = Tabs::new(vec!["1 Drift", "2 Attribution", "3 Budget"])
         .select(app.tab)
@@ -186,6 +193,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" tabs  "),
         Span::styled("w", Style::new().fg(Color::Cyan)),
         Span::raw(" 5h/7d  "),
+        Span::styled("m", Style::new().fg(Color::Cyan)),
+        Span::raw(" method  "),
         Span::styled("r", Style::new().fg(Color::Cyan)),
         Span::raw(" reload  "),
         Span::styled("q", Style::new().fg(Color::Cyan)),
@@ -213,7 +222,7 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
     for (idx, model) in models.iter().enumerate() {
         let color = PALETTE[idx % PALETTE.len()];
         let short = short_model(model);
-        match app.data.model_drift_summary(&p, model, win) {
+        match app.data.model_drift_summary(&p, model, win, app.method) {
             Some((recent, older, change)) => {
                 any = true;
                 let (arrow, vcolor, verdict) = if change > 2.0 {
@@ -230,7 +239,7 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
                 ]));
             }
             None => {
-                if let Some((rate, n)) = app.data.model_rate(&p, model, win) {
+                if let Some((rate, n)) = app.data.model_rate(&p, model, win, app.method) {
                     any = true;
                     lines.push(Line::from(vec![
                         Span::styled(format!("  {short:14} "), Style::new().fg(color).bold()),
@@ -267,7 +276,7 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
             (
                 short_model(m),
                 PALETTE[idx % PALETTE.len()],
-                app.data.model_drift_series(&p, m, win),
+                app.data.model_drift_series(&p, m, win, app.method),
             )
         })
         .filter(|(_, _, s)| !s.is_empty())
@@ -336,7 +345,8 @@ fn draw_attr(f: &mut Frame, app: &App, area: Rect) {
     let win = app.window;
     let rows = app.data.by_model();
     // Look up each model's current-window rate; find the max for highlighting.
-    let rate_of = |r: &crate::data::ModelRow| app.data.model_rate(&r.provider, &r.model, win).map(|(v, _)| v);
+    let rate_of =
+        |r: &crate::data::ModelRow| app.data.model_rate(&r.provider, &r.model, win, app.method).map(|(v, _)| v);
     let max_rate = rows.iter().filter_map(rate_of).fold(0.0_f64, f64::max);
 
     let header = Row::new(vec!["harness", "model", "weighted", "output", "calls", "%/Mtok"])
@@ -438,7 +448,7 @@ fn draw_budget(f: &mut Frame, app: &App, area: Rect) {
         if shown >= 3 {
             break;
         }
-        if let Some((rate, _)) = app.data.model_rate(&p, &model, Window::SevenDay) {
+        if let Some((rate, _)) = app.data.model_rate(&p, &model, Window::SevenDay, app.method) {
             if rate > 0.0 {
                 let tok = remaining_pct / rate * 1_000_000.0;
                 lines.push(Line::from(vec![
@@ -489,16 +499,20 @@ mod tests {
             data,
             tab: 0,
             window: Window::SevenDay,
+            method: Method::Single,
             last_reload: Instant::now(),
             loaded_ago: Instant::now(),
         };
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("term");
-        for w in [Window::FiveHour, Window::SevenDay] {
-            app.window = w;
-            for t in 0..3 {
-                app.tab = t;
-                terminal.draw(|f| draw(f, &app)).expect("draw");
+        for method in [Method::Single, Method::Nnls] {
+            app.method = method;
+            for w in [Window::FiveHour, Window::SevenDay] {
+                app.window = w;
+                for t in 0..3 {
+                    app.tab = t;
+                    terminal.draw(|f| draw(f, &app)).expect("draw");
+                }
             }
         }
     }

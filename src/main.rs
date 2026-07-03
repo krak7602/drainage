@@ -8,7 +8,7 @@ mod tui;
 use analysis::{day_key, Window};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use data::Dataset;
+use data::{Dataset, Method};
 use model::{Harness, Weights};
 
 
@@ -114,29 +114,40 @@ fn scan() -> Result<()> {
     println!();
 
     println!("exchange rate PER MODEL  (Δ window-% per 1M weighted tokens; cache-reads excluded)");
+    println!("  single-model = intervals a model dominated (trusted) · nnls = decomposed incl.");
+    println!("  mixed (experimental: util% is ~1%-quantized, which biases per-interval NNLS low)");
     let mut any = false;
     for provider in d.providers() {
         for window in [Window::FiveHour, Window::SevenDay] {
             let mut header_done = false;
             for model in d.models(&provider) {
-                if let Some((rate, n)) = d.model_rate(&provider, &model, window) {
-                    any = true;
-                    if !header_done {
-                        println!("  {provider} [{}]:", window.label());
-                        header_done = true;
-                    }
-                    let drift = d
-                        .model_drift_summary(&provider, &model, window)
-                        .map(|(r, o, c)| format!("   drift {o:.2}→{r:.2} ({c:+.0}%)"))
-                        .unwrap_or_default();
-                    println!("      {:<22} {rate:>7.2} %/Mtok  (n={n}){drift}", truncate(&model, 22));
+                let single = d.model_rate(&provider, &model, window, Method::Single);
+                let nnls = d.model_rate(&provider, &model, window, Method::Nnls);
+                if single.is_none() && nnls.is_none() {
+                    continue;
                 }
+                any = true;
+                if !header_done {
+                    println!("  {provider} [{}]:", window.label());
+                    header_done = true;
+                }
+                let s = single
+                    .map(|(r, n)| format!("single {r:>6.2} (n={n})"))
+                    .unwrap_or_else(|| "single    —    ".into());
+                let nn = nnls
+                    .map(|(r, _)| format!("nnls {r:>6.2}"))
+                    .unwrap_or_else(|| "nnls   — ".into());
+                let drift = d
+                    .model_drift_summary(&provider, &model, window, Method::Single)
+                    .map(|(r, o, c)| format!("   drift {o:.2}→{r:.2} ({c:+.0}%)"))
+                    .unwrap_or_default();
+                println!("      {:<22} {s}  |  {nn} %/Mtok{drift}", truncate(&model, 22));
             }
             if header_done {
                 let (attr, mixed) = d.attribution_coverage(&provider, window);
                 if attr + mixed > 0.0 && mixed > 0.0 {
                     println!(
-                        "      unattributed: {:.0}% of spend in mixed-model intervals (priced later via NNLS)",
+                        "      (single-model leaves {:.0}% of spend unattributed; nnls uses it)",
                         mixed / (attr + mixed) * 100.0
                     );
                 }

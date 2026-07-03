@@ -6,11 +6,38 @@
 //! Mixed intervals are left unattributed (reported as a fraction) until the
 //! NNLS/Kalman stages mine them.
 
-use crate::analysis::{analyze, day_key, median, Analysis, Window, DOMINANT_SHARE};
+use crate::analysis::{analyze, day_key, median, nnls, Analysis, Interval, Window, DOMINANT_SHARE};
 use crate::model::{Harness, Provider, TokenEvent, UtilSnapshot, Weights};
 use crate::sources;
 use anyhow::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// How a per-model rate is estimated.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// Stage 1: only intervals a model dominated (≥90% of spend). Transparent.
+    Single,
+    /// Stage 2: non-negative least squares over all intervals, incl. mixed ones.
+    Nnls,
+}
+
+impl Method {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Method::Single => "single-model",
+            Method::Nnls => "NNLS",
+        }
+    }
+    pub fn toggle(&self) -> Method {
+        match self {
+            Method::Single => Method::Nnls,
+            Method::Nnls => Method::Single,
+        }
+    }
+}
+
+/// Rolling window used to estimate a time-local NNLS fit for drift.
+const NNLS_WINDOW_SECS: i64 = 3 * 86_400;
 
 pub struct ModelRow {
     pub harness: Harness,
@@ -125,39 +152,68 @@ impl Dataset {
         v.into_iter().map(|(m, _)| m).collect()
     }
 
-    /// Stage-1 exchange rate for one model+window: median Δ% per weighted Mtok
-    /// over intervals that model dominated. Returns (rate, n_intervals).
-    pub fn model_rate(&self, provider: &Provider, model: &str, window: Window) -> Option<(f64, usize)> {
-        let mut rates: Vec<f64> = self
-            .single_model_intervals(provider, model, window)
-            .map(|i| i.delta_pct / (i.total_weighted / 1_000_000.0))
-            .collect();
-        if rates.is_empty() {
-            None
-        } else {
-            let n = rates.len();
-            Some((median(&mut rates), n))
+    /// Exchange rate for one model+window under the chosen method.
+    /// Returns (rate %/Mtok, n_intervals the estimate rests on).
+    pub fn model_rate(
+        &self,
+        provider: &Provider,
+        model: &str,
+        window: Window,
+        method: Method,
+    ) -> Option<(f64, usize)> {
+        match method {
+            Method::Single => {
+                let mut rates: Vec<f64> = self
+                    .single_model_intervals(provider, model, window)
+                    .map(|i| i.delta_pct / (i.total_weighted / 1_000_000.0))
+                    .collect();
+                if rates.is_empty() {
+                    None
+                } else {
+                    let n = rates.len();
+                    Some((median(&mut rates), n))
+                }
+            }
+            Method::Nnls => {
+                let ivs = self.window_intervals(provider, window);
+                if ivs.is_empty() {
+                    return None;
+                }
+                self.nnls_over(&ivs).get(model).map(|&r| (r, ivs.len()))
+            }
         }
     }
 
-    /// Per-day median rate for one model+window — the drift series to chart.
-    pub fn model_drift_series(&self, provider: &Provider, model: &str, window: Window) -> Vec<(f64, f64)> {
-        let mut per_day: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-        let mut day_ts: BTreeMap<String, i64> = BTreeMap::new();
-        for i in self.single_model_intervals(provider, model, window) {
-            let k = day_key(i.t1);
-            per_day
-                .entry(k.clone())
-                .or_default()
-                .push(i.delta_pct / (i.total_weighted / 1_000_000.0));
-            day_ts.entry(k).or_insert(i.t1);
+    /// Drift series (per-day points) for one model+window under the chosen
+    /// method: stage-1 uses single-model intervals; NNLS uses a rolling fit.
+    pub fn model_drift_series(
+        &self,
+        provider: &Provider,
+        model: &str,
+        window: Window,
+        method: Method,
+    ) -> Vec<(f64, f64)> {
+        match method {
+            Method::Single => {
+                let mut per_day: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+                let mut day_ts: BTreeMap<String, i64> = BTreeMap::new();
+                for i in self.single_model_intervals(provider, model, window) {
+                    let k = day_key(i.t1);
+                    per_day
+                        .entry(k.clone())
+                        .or_default()
+                        .push(i.delta_pct / (i.total_weighted / 1_000_000.0));
+                    day_ts.entry(k).or_insert(i.t1);
+                }
+                let mut out: Vec<(f64, f64)> = per_day
+                    .into_iter()
+                    .map(|(k, mut rs)| (day_ts[&k] as f64, median(&mut rs)))
+                    .collect();
+                out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                out
+            }
+            Method::Nnls => self.nnls_series_all(provider, window).remove(model).unwrap_or_default(),
         }
-        let mut out: Vec<(f64, f64)> = per_day
-            .into_iter()
-            .map(|(k, mut rs)| (day_ts[&k] as f64, median(&mut rs)))
-            .collect();
-        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        out
     }
 
     /// (recent median, older median, % change) for one model+window.
@@ -166,8 +222,9 @@ impl Dataset {
         provider: &Provider,
         model: &str,
         window: Window,
+        method: Method,
     ) -> Option<(f64, f64, f64)> {
-        let series = self.model_drift_series(provider, model, window);
+        let series = self.model_drift_series(provider, model, window, method);
         if series.len() < 2 {
             return None;
         }
@@ -178,6 +235,100 @@ impl Dataset {
         let r = median(&mut recent);
         let change = if o > 0.0 { (r - o) / o * 100.0 } else { 0.0 };
         Some((r, o, change))
+    }
+
+    fn window_intervals(&self, provider: &Provider, window: Window) -> Vec<&Interval> {
+        self.analysis
+            .intervals
+            .iter()
+            .filter(|i| &i.provider == provider && i.window == window)
+            .collect()
+    }
+
+    /// Solve one NNLS fit over the given intervals → per-model rate (%/Mtok).
+    fn nnls_over(&self, intervals: &[&Interval]) -> BTreeMap<String, f64> {
+        if intervals.is_empty() {
+            return BTreeMap::new();
+        }
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        for iv in intervals {
+            for (m, w) in &iv.tokens_by_model {
+                if *w > 0.0 {
+                    set.insert(m.clone());
+                }
+            }
+        }
+        let models: Vec<String> = set.into_iter().collect();
+        let ncols = models.len();
+        if ncols == 0 {
+            return BTreeMap::new();
+        }
+        let idx: BTreeMap<&str, usize> =
+            models.iter().enumerate().map(|(i, m)| (m.as_str(), i)).collect();
+        let rows: Vec<(Vec<f64>, f64)> = intervals
+            .iter()
+            .map(|iv| {
+                let mut row = vec![0.0; ncols];
+                for (m, w) in &iv.tokens_by_model {
+                    if let Some(&j) = idx.get(m.as_str()) {
+                        row[j] = w / 1_000_000.0;
+                    }
+                }
+                (row, iv.delta_pct)
+            })
+            .collect();
+        let x = nnls(ncols, &rows, 1e-6);
+        models.into_iter().zip(x).collect()
+    }
+
+    /// Rolling-window NNLS → per-model drift series (all models at once).
+    fn nnls_series_all(&self, provider: &Provider, window: Window) -> BTreeMap<String, Vec<(f64, f64)>> {
+        let ivs = self.window_intervals(provider, window);
+        let mut out: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
+        if ivs.is_empty() {
+            return out;
+        }
+        let ncols = {
+            let mut s: BTreeSet<&str> = BTreeSet::new();
+            for iv in &ivs {
+                for (m, w) in &iv.tokens_by_model {
+                    if *w > 0.0 {
+                        s.insert(m.as_str());
+                    }
+                }
+            }
+            s.len()
+        };
+        let min_rows = ncols.max(2);
+        // One fit per day, over the trailing NNLS_WINDOW_SECS of intervals.
+        let mut day_rep: BTreeMap<String, i64> = BTreeMap::new();
+        for iv in &ivs {
+            day_rep
+                .entry(day_key(iv.t1))
+                .and_modify(|t| {
+                    if iv.t1 > *t {
+                        *t = iv.t1;
+                    }
+                })
+                .or_insert(iv.t1);
+        }
+        for &rep in day_rep.values() {
+            let win: Vec<&Interval> = ivs
+                .iter()
+                .copied()
+                .filter(|i| i.t1 <= rep && i.t1 > rep - NNLS_WINDOW_SECS)
+                .collect();
+            if win.len() < min_rows {
+                continue;
+            }
+            for (m, r) in self.nnls_over(&win) {
+                out.entry(m).or_default().push((rep as f64, r));
+            }
+        }
+        for v in out.values_mut() {
+            v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        }
+        out
     }
 
     /// (attributed weighted tokens, unattributed/mixed weighted tokens) for a
