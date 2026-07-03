@@ -1,7 +1,7 @@
-//! The drainage TUI. Three tabs, in priority order: Drift (is my exchange rate
-//! getting worse over time?), Attribution (which model/activity drains the limit
-//! fastest?), and Budget (how much of each window is left, and for how long?).
-//! Reloads from disk every few seconds so it tracks live usage.
+//! The drainage TUI. Three tabs, in priority order: Drift (is my per-model
+//! exchange rate getting worse over time?), Attribution (which model drains the
+//! limit fastest?), and Budget (how much of each window is left, and for how
+//! long?). Reloads from disk every few seconds so it tracks live usage.
 
 use crate::analysis::Window;
 use crate::data::Dataset as Data;
@@ -20,10 +20,24 @@ use ratatui::Frame;
 use std::time::{Duration, Instant};
 
 const RELOAD_EVERY: Duration = Duration::from_secs(3);
+/// Distinct colors for per-model chart lines / labels.
+const PALETTE: [Color; 6] = [
+    Color::Cyan,
+    Color::Magenta,
+    Color::Yellow,
+    Color::Green,
+    Color::Blue,
+    Color::LightRed,
+];
+const MAX_MODELS: usize = 5;
+
+/// A model's drift line for the chart: (short label, color, per-day points).
+type ModelSeries = (String, Color, Vec<(f64, f64)>);
 
 struct App {
     data: Data,
     tab: usize,
+    window: Window,
     last_reload: Instant,
     loaded_ago: Instant,
 }
@@ -33,6 +47,7 @@ pub fn run() -> Result<()> {
     let mut app = App {
         data,
         tab: 0,
+        window: Window::SevenDay,
         last_reload: Instant::now(),
         loaded_ago: Instant::now(),
     };
@@ -52,6 +67,7 @@ pub fn run() -> Result<()> {
                         KeyCode::Char('3') => app.tab = 2,
                         KeyCode::Tab | KeyCode::Right => app.tab = (app.tab + 1) % 3,
                         KeyCode::Left => app.tab = (app.tab + 2) % 3,
+                        KeyCode::Char('w') => app.window = app.window.other(),
                         KeyCode::Char('r') => reload(&mut app),
                         _ => {}
                     }
@@ -78,13 +94,25 @@ fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// The busiest subscription account — what the single-provider panels focus on.
 fn primary(app: &App) -> Provider {
     app.data
         .providers()
         .first()
         .cloned()
         .unwrap_or(Provider::Anthropic)
+}
+
+/// Shorten a model id for display: strip the `claude-` prefix and any trailing
+/// `-YYYYMMDD` date segment.
+fn short_model(m: &str) -> String {
+    let s = m.strip_prefix("claude-").unwrap_or(m);
+    if let Some(idx) = s.rfind('-') {
+        let tail = &s[idx + 1..];
+        if tail.len() >= 6 && tail.chars().all(|c| c.is_ascii_digit()) {
+            return s[..idx].to_string();
+        }
+    }
+    s.to_string()
 }
 
 fn human(n: f64) -> String {
@@ -141,7 +169,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or((0.0, 0.0));
     let title = Line::from(vec![
         Span::styled(" drainage ", Style::new().bold().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(format!("  {p} 5h:{five:.0}%  7d:{week:.0}%")),
+        Span::raw(format!("  {p} 5h:{five:.0}%  7d:{week:.0}%  ·  window: {}", app.window.label())),
     ]);
     let tabs = Tabs::new(vec!["1 Drift", "2 Attribution", "3 Budget"])
         .select(app.tab)
@@ -156,30 +184,39 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let help = Line::from(vec![
         Span::styled("1/2/3", Style::new().fg(Color::Cyan)),
         Span::raw(" tabs  "),
+        Span::styled("w", Style::new().fg(Color::Cyan)),
+        Span::raw(" 5h/7d  "),
         Span::styled("r", Style::new().fg(Color::Cyan)),
         Span::raw(" reload  "),
         Span::styled("q", Style::new().fg(Color::Cyan)),
-        Span::raw(format!(" quit   ·   updated {ago}s ago, reloads live")),
+        Span::raw(format!(" quit   ·   updated {ago}s ago")),
     ]);
     f.render_widget(Paragraph::new(help).style(Style::new().fg(Color::Gray)), area);
 }
 
 fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
     let p = primary(app);
+    let win = app.window;
+    let models: Vec<String> = app.data.models(&p).into_iter().take(MAX_MODELS).collect();
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(0)])
+        .constraints([Constraint::Length(8), Constraint::Min(0)])
         .split(area);
 
-    // ---- Summary: recent vs older median, per window ----
+    // ---- Per-model summary ----
     let mut lines = vec![Line::from(Span::styled(
-        format!("Is my {p} rate getting worse?  (higher %/Mtok = less usage per token = worse)"),
+        format!("Is my {p} {} rate getting worse?  (per model · higher %/Mtok = worse)", win.label()),
         Style::new().fg(Color::Gray),
     ))];
-    for (w, name) in [(Window::FiveHour, "5h"), (Window::SevenDay, "7d")] {
-        match app.data.drift_summary(&p, w) {
+    let mut any = false;
+    for (idx, model) in models.iter().enumerate() {
+        let color = PALETTE[idx % PALETTE.len()];
+        let short = short_model(model);
+        match app.data.model_drift_summary(&p, model, win) {
             Some((recent, older, change)) => {
-                let (arrow, color, verdict) = if change > 2.0 {
+                any = true;
+                let (arrow, vcolor, verdict) = if change > 2.0 {
                     ("▲", Color::Red, "worse")
                 } else if change < -2.0 {
                     ("▼", Color::Green, "better")
@@ -187,42 +224,58 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
                     ("≈", Color::Yellow, "stable")
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {name}: "), Style::new().bold()),
-                    Span::raw(format!("now {recent:.2} %/Mtok  vs  {older:.2} earlier   ")),
-                    Span::styled(
-                        format!("{arrow} {change:+.0}% {verdict}"),
-                        Style::new().fg(color).bold(),
-                    ),
+                    Span::styled(format!("  {short:14} "), Style::new().fg(color).bold()),
+                    Span::raw(format!("now {recent:.2}  vs {older:.2}   ")),
+                    Span::styled(format!("{arrow} {change:+.0}% {verdict}"), Style::new().fg(vcolor).bold()),
                 ]));
             }
             None => {
-                let med = app.data.median_rate(&p, w);
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {name}: "), Style::new().bold()),
-                    match med {
-                        Some(m) => Span::raw(format!(
-                            "{m:.2} %/Mtok  (need ≥2 days of data to show drift)"
-                        )),
-                        None => Span::styled(
-                            "collecting… keep using Claude Code",
-                            Style::new().fg(Color::DarkGray),
-                        ),
-                    },
-                ]));
+                if let Some((rate, n)) = app.data.model_rate(&p, model, win) {
+                    any = true;
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {short:14} "), Style::new().fg(color).bold()),
+                        Span::raw(format!("{rate:.2} %/Mtok  (n={n}, need ≥2 days for drift)")),
+                    ]));
+                }
             }
         }
+    }
+    if !any {
+        lines.push(Line::from(Span::styled(
+            "  collecting… keep using your agents; per-model rates fill in here.",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    let (attr, mixed) = app.data.attribution_coverage(&p, win);
+    if attr + mixed > 0.0 {
+        let frac = mixed / (attr + mixed) * 100.0;
+        lines.push(Line::from(Span::styled(
+            format!("  unattributed: {frac:.0}% of spend is in mixed-model intervals (priced later via NNLS)"),
+            Style::new().fg(Color::DarkGray),
+        )));
     }
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" drift ")),
         rows[0],
     );
 
-    // ---- Chart ----
-    let s5 = app.data.drift_series(&p, Window::FiveHour);
-    let s7 = app.data.drift_series(&p, Window::SevenDay);
-    if s5.len() + s7.len() < 2 {
+    // ---- Per-model chart ----
+    let series: Vec<ModelSeries> = models
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| {
+            (
+                short_model(m),
+                PALETTE[idx % PALETTE.len()],
+                app.data.model_drift_series(&p, m, win),
+            )
+        })
+        .filter(|(_, _, s)| !s.is_empty())
+        .collect();
+    let total_pts: usize = series.iter().map(|(_, _, s)| s.len()).sum();
+    if total_pts < 2 {
         f.render_widget(
-            Paragraph::new("Not enough snapshots yet to chart drift.\nThe collector is live — this fills in as you use Claude Code.")
+            Paragraph::new("Not enough per-model snapshots yet to chart drift.\nThe collector is live — this fills in as you use your agents.")
                 .block(Block::default().borders(Borders::ALL).title(" exchange-rate over time "))
                 .style(Style::new().fg(Color::DarkGray)),
             rows[1],
@@ -230,87 +283,81 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let all_x: Vec<f64> = s5.iter().chain(s7.iter()).map(|p| p.0).collect();
-    let all_y: Vec<f64> = s5.iter().chain(s7.iter()).map(|p| p.1).collect();
-    let xmin = all_x.iter().cloned().fold(f64::INFINITY, f64::min);
-    let xmax = all_x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let ymax = all_y.iter().cloned().fold(0.0_f64, f64::max).max(1.0) * 1.2;
-    let xmax = if xmax <= xmin { xmin + 1.0 } else { xmax };
+    let xs: Vec<f64> = series.iter().flat_map(|(_, _, s)| s.iter().map(|p| p.0)).collect();
+    let ys: Vec<f64> = series.iter().flat_map(|(_, _, s)| s.iter().map(|p| p.1)).collect();
+    let xmin = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mut xmax = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if xmax <= xmin {
+        xmax = xmin + 1.0;
+    }
+    let ymax = ys.iter().cloned().fold(0.0_f64, f64::max).max(1.0) * 1.2;
 
-    let datasets = vec![
-        ChartDataset::default()
-            .name("5h")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(Color::Cyan))
-            .data(&s5),
-        ChartDataset::default()
-            .name("7d")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(Color::Magenta))
-            .data(&s7),
-    ];
-    let x_labels = vec![
-        Span::raw(crate::analysis::day_key(xmin as i64)),
-        Span::raw(crate::analysis::day_key(xmax as i64)),
-    ];
-    let y_labels = vec![
-        Span::raw("0"),
-        Span::raw(format!("{:.0}", ymax / 2.0)),
-        Span::raw(format!("{ymax:.0}")),
-    ];
+    let datasets: Vec<ChartDataset> = series
+        .iter()
+        .map(|(name, color, s)| {
+            ChartDataset::default()
+                .name(name.clone())
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::new().fg(*color))
+                .data(s)
+        })
+        .collect();
     let chart = Chart::new(datasets)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" exchange-rate over time  (cyan 5h · magenta 7d) "),
+                .title(format!(" exchange-rate over time · {} (%/Mtok, per model) ", win.label())),
         )
         .x_axis(
             Axis::default()
                 .style(Style::new().fg(Color::DarkGray))
                 .bounds([xmin, xmax])
-                .labels(x_labels),
+                .labels(vec![
+                    Span::raw(crate::analysis::day_key(xmin as i64)),
+                    Span::raw(crate::analysis::day_key(xmax as i64)),
+                ]),
         )
         .y_axis(
             Axis::default()
                 .title("%/Mtok")
                 .style(Style::new().fg(Color::DarkGray))
                 .bounds([0.0, ymax])
-                .labels(y_labels),
+                .labels(vec![
+                    Span::raw("0"),
+                    Span::raw(format!("{:.0}", ymax / 2.0)),
+                    Span::raw(format!("{ymax:.0}")),
+                ]),
         );
     f.render_widget(chart, rows[1]);
 }
 
 fn draw_attr(f: &mut Frame, app: &App, area: Rect) {
+    let win = app.window;
     let rows = app.data.by_model();
-    let max_rate = rows
-        .iter()
-        .filter_map(|r| r.rate_5h)
-        .fold(0.0_f64, f64::max);
+    // Look up each model's current-window rate; find the max for highlighting.
+    let rate_of = |r: &crate::data::ModelRow| app.data.model_rate(&r.provider, &r.model, win).map(|(v, _)| v);
+    let max_rate = rows.iter().filter_map(rate_of).fold(0.0_f64, f64::max);
 
-    let header = Row::new(vec!["harness", "model", "weighted", "output", "calls", "5h %/Mtok"])
+    let header = Row::new(vec!["harness", "model", "weighted", "output", "calls", "%/Mtok"])
         .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     let body: Vec<Row> = rows
         .iter()
         .map(|r| {
-            let rate = match r.rate_5h {
-                Some(v) => format!("{v:.2}"),
-                None => "—".into(),
-            };
-            // Highlight the fastest drainer.
-            let style = if r.rate_5h.map(|v| v >= max_rate && max_rate > 0.0).unwrap_or(false) {
+            let rate = rate_of(r);
+            let rate_s = rate.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into());
+            let style = if rate.map(|v| v >= max_rate && max_rate > 0.0).unwrap_or(false) {
                 Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
             };
             Row::new(vec![
                 Cell::from(r.harness.to_string()),
-                Cell::from(r.model.clone()),
+                Cell::from(short_model(&r.model)),
                 Cell::from(human(r.weighted)),
                 Cell::from(human(r.output as f64)),
                 Cell::from(r.calls.to_string()),
-                Cell::from(rate),
+                Cell::from(rate_s),
             ])
             .style(style)
         })
@@ -320,19 +367,18 @@ fn draw_attr(f: &mut Frame, app: &App, area: Rect) {
         body,
         [
             Constraint::Length(12),
-            Constraint::Min(20),
+            Constraint::Min(16),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(8),
-            Constraint::Length(10),
+            Constraint::Length(9),
         ],
     )
     .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" what drains the limit fastest  (red = highest %/Mtok) "),
-    );
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " what drains the {} limit fastest  (red = highest %/Mtok) ",
+        win.label()
+    )));
     f.render_widget(table, area);
 }
 
@@ -380,46 +426,35 @@ fn draw_budget(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(gauge(five, five_reset, &format!("{p} · 5-hour window")), cols[0]);
     f.render_widget(gauge(week, week_reset, &format!("{p} · 7-day window")), cols[1]);
 
-    // Projection: remaining weighted tokens until the 7d window is full.
-    let mut lines = vec![];
-    match app.data.median_rate(&p, Window::SevenDay) {
-        Some(rate) if rate > 0.0 => {
-            let remaining_pct = (100.0 - week).max(0.0);
-            let remaining_tok = remaining_pct / rate * 1_000_000.0;
-            lines.push(Line::from(vec![
-                Span::raw("At your current 7d rate ("),
-                Span::styled(format!("{rate:.2} %/Mtok"), Style::new().fg(Color::Cyan)),
-                Span::raw("), about "),
-                Span::styled(human(remaining_tok), Style::new().fg(Color::Green).bold()),
-                Span::raw(" weighted tokens remain this week."),
-            ]));
+    // Per-model projection: how many more tokens of each model until the 7d
+    // window is full, at that model's own measured rate.
+    let mut lines = vec![Line::from(Span::styled(
+        "Weekly headroom, per model (at each model's own measured rate):",
+        Style::new().fg(Color::Gray),
+    ))];
+    let remaining_pct = (100.0 - week).max(0.0);
+    let mut shown = 0;
+    for (idx, model) in app.data.models(&p).into_iter().enumerate() {
+        if shown >= 3 {
+            break;
         }
-        _ => lines.push(Line::from(Span::styled(
-            "Projection unlocks once an exchange rate has been measured.",
-            Style::new().fg(Color::DarkGray),
-        ))),
+        if let Some((rate, _)) = app.data.model_rate(&p, &model, Window::SevenDay) {
+            if rate > 0.0 {
+                let tok = remaining_pct / rate * 1_000_000.0;
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:14} ", short_model(&model)), Style::new().fg(PALETTE[idx % PALETTE.len()]).bold()),
+                    Span::raw("~"),
+                    Span::styled(human(tok), Style::new().fg(Color::Green).bold()),
+                    Span::raw(format!(" more {} tokens  (rate {rate:.1} %/Mtok)", short_model(&model))),
+                ]));
+                shown += 1;
+            }
+        }
     }
-    // Other accounts (providers) we also track utilization for.
-    let others: Vec<String> = app
-        .data
-        .providers()
-        .into_iter()
-        .filter(|q| q != &p)
-        .filter_map(|q| {
-            app.data.latest_snap(&q).map(|s| {
-                format!(
-                    "{q} 5h:{:.0}% 7d:{:.0}%",
-                    s.five_pct.unwrap_or(0.0),
-                    s.week_pct.unwrap_or(0.0)
-                )
-            })
-        })
-        .collect();
-    if !others.is_empty() {
-        lines.push(Line::from(""));
+    if shown == 0 {
         lines.push(Line::from(Span::styled(
-            format!("other accounts: {}", others.join("   ")),
-            Style::new().fg(Color::Gray),
+            "  projection unlocks once a per-model rate has been measured.",
+            Style::new().fg(Color::DarkGray),
         )));
     }
     lines.push(Line::from(""));
@@ -447,21 +482,24 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    /// Render every tab headlessly to catch layout/bounds panics on real data.
     #[test]
     fn renders_all_tabs() {
         let data = Data::load(Weights::default()).expect("load");
         let mut app = App {
             data,
             tab: 0,
+            window: Window::SevenDay,
             last_reload: Instant::now(),
             loaded_ago: Instant::now(),
         };
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("term");
-        for t in 0..3 {
-            app.tab = t;
-            terminal.draw(|f| draw(f, &app)).expect("draw");
+        for w in [Window::FiveHour, Window::SevenDay] {
+            app.window = w;
+            for t in 0..3 {
+                app.tab = t;
+                terminal.draw(|f| draw(f, &app)).expect("draw");
+            }
         }
     }
 }

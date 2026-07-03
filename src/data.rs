@@ -1,7 +1,12 @@
-//! A loaded snapshot of everything drainage knows, plus the aggregations the
-//! CLI and the TUI both render. Reloadable, so the TUI can poll for live data.
+//! A loaded snapshot of everything drainage knows, plus the per-model
+//! aggregations the CLI and TUI render. Reloadable, so the TUI can poll live.
+//!
+//! Stage 1 attribution: a model's exchange rate is the median, over intervals
+//! where that model was ≥`DOMINANT_SHARE` of spend, of Δ% ÷ (weighted Mtok).
+//! Mixed intervals are left unattributed (reported as a fraction) until the
+//! NNLS/Kalman stages mine them.
 
-use crate::analysis::{analyze, day_key, median, Analysis, Window};
+use crate::analysis::{analyze, day_key, median, Analysis, Window, DOMINANT_SHARE};
 use crate::model::{Harness, Provider, TokenEvent, UtilSnapshot, Weights};
 use crate::sources;
 use anyhow::Result;
@@ -15,8 +20,6 @@ pub struct ModelRow {
     pub output: u64,
     pub weighted: f64,
     pub calls: u64,
-    /// Median 5h exchange rate when this model dominated an interval.
-    pub rate_5h: Option<f64>,
 }
 
 pub struct Dataset {
@@ -71,7 +74,7 @@ impl Dataset {
     }
 
     /// Distinct subscription accounts (providers) we have utilization for,
-    /// ordered by snapshot count desc so the busiest is "primary".
+    /// busiest first (so the busiest is "primary").
     pub fn providers(&self) -> Vec<Provider> {
         let mut counts: BTreeMap<Provider, usize> = BTreeMap::new();
         for s in &self.snaps {
@@ -82,7 +85,11 @@ impl Dataset {
         v.into_iter().map(|(p, _)| p).collect()
     }
 
-    /// Per-model spend + exchange rate, sorted by weighted spend desc.
+    pub fn latest_snap(&self, provider: &Provider) -> Option<&UtilSnapshot> {
+        self.snaps.iter().rev().find(|s| &s.provider == provider)
+    }
+
+    /// Per-model spend rows for the attribution table, weighted-desc.
     pub fn by_model(&self) -> Vec<ModelRow> {
         let mut acc: BTreeMap<(Harness, String), ModelRow> = BTreeMap::new();
         for e in &self.events {
@@ -96,7 +103,6 @@ impl Dataset {
                     output: 0,
                     weighted: 0.0,
                     calls: 0,
-                    rate_5h: None,
                 });
             row.raw += e.raw_total();
             row.output += e.output;
@@ -104,38 +110,46 @@ impl Dataset {
             row.calls += 1;
         }
         let mut rows: Vec<ModelRow> = acc.into_values().collect();
-        for row in &mut rows {
-            let mut rates: Vec<f64> = self
-                .analysis
-                .intervals
-                .iter()
-                .filter(|i| {
-                    i.provider == row.provider
-                        && i.window == Window::FiveHour
-                        && i.dominant_model == row.model
-                })
-                .map(|i| i.rate_per_mtok)
-                .collect();
-            if !rates.is_empty() {
-                row.rate_5h = Some(median(&mut rates));
-            }
-        }
         rows.sort_by(|a, b| b.weighted.partial_cmp(&a.weighted).unwrap());
         rows
     }
 
-    /// Per-day median exchange rate for a window — the drift series for charts.
-    pub fn drift_series(&self, provider: &Provider, window: Window) -> Vec<(f64, f64)> {
+    /// Models for a provider (from any harness), by weighted spend desc.
+    pub fn models(&self, provider: &Provider) -> Vec<String> {
+        let mut acc: BTreeMap<String, f64> = BTreeMap::new();
+        for e in self.events.iter().filter(|e| &e.provider == provider) {
+            *acc.entry(e.model.clone()).or_default() += e.weighted(&self.weights);
+        }
+        let mut v: Vec<(String, f64)> = acc.into_iter().collect();
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        v.into_iter().map(|(m, _)| m).collect()
+    }
+
+    /// Stage-1 exchange rate for one model+window: median Δ% per weighted Mtok
+    /// over intervals that model dominated. Returns (rate, n_intervals).
+    pub fn model_rate(&self, provider: &Provider, model: &str, window: Window) -> Option<(f64, usize)> {
+        let mut rates: Vec<f64> = self
+            .single_model_intervals(provider, model, window)
+            .map(|i| i.delta_pct / (i.total_weighted / 1_000_000.0))
+            .collect();
+        if rates.is_empty() {
+            None
+        } else {
+            let n = rates.len();
+            Some((median(&mut rates), n))
+        }
+    }
+
+    /// Per-day median rate for one model+window — the drift series to chart.
+    pub fn model_drift_series(&self, provider: &Provider, model: &str, window: Window) -> Vec<(f64, f64)> {
         let mut per_day: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         let mut day_ts: BTreeMap<String, i64> = BTreeMap::new();
-        for i in self
-            .analysis
-            .intervals
-            .iter()
-            .filter(|i| &i.provider == provider && i.window == window)
-        {
+        for i in self.single_model_intervals(provider, model, window) {
             let k = day_key(i.t1);
-            per_day.entry(k.clone()).or_default().push(i.rate_per_mtok);
+            per_day
+                .entry(k.clone())
+                .or_default()
+                .push(i.delta_pct / (i.total_weighted / 1_000_000.0));
             day_ts.entry(k).or_insert(i.t1);
         }
         let mut out: Vec<(f64, f64)> = per_day
@@ -146,30 +160,14 @@ impl Dataset {
         out
     }
 
-    pub fn latest_snap(&self, provider: &Provider) -> Option<&UtilSnapshot> {
-        self.snaps.iter().rev().find(|s| &s.provider == provider)
-    }
-
-    /// Overall median exchange rate for a window (across all models).
-    pub fn median_rate(&self, provider: &Provider, window: Window) -> Option<f64> {
-        let mut rates: Vec<f64> = self
-            .analysis
-            .intervals
-            .iter()
-            .filter(|i| &i.provider == provider && i.window == window)
-            .map(|i| i.rate_per_mtok)
-            .collect();
-        if rates.is_empty() {
-            None
-        } else {
-            Some(median(&mut rates))
-        }
-    }
-
-    /// Drift readout: (recent median, older median, pct change) for a window,
-    /// splitting the drift series at its midpoint in time.
-    pub fn drift_summary(&self, provider: &Provider, window: Window) -> Option<(f64, f64, f64)> {
-        let series = self.drift_series(provider, window);
+    /// (recent median, older median, % change) for one model+window.
+    pub fn model_drift_summary(
+        &self,
+        provider: &Provider,
+        model: &str,
+        window: Window,
+    ) -> Option<(f64, f64, f64)> {
+        let series = self.model_drift_series(provider, model, window);
         if series.len() < 2 {
             return None;
         }
@@ -180,5 +178,38 @@ impl Dataset {
         let r = median(&mut recent);
         let change = if o > 0.0 { (r - o) / o * 100.0 } else { 0.0 };
         Some((r, o, change))
+    }
+
+    /// (attributed weighted tokens, unattributed/mixed weighted tokens) for a
+    /// window — so we can honestly report how much spend stage 1 can't yet price.
+    pub fn attribution_coverage(&self, provider: &Provider, window: Window) -> (f64, f64) {
+        let mut attributed = 0.0;
+        let mut mixed = 0.0;
+        for i in self
+            .analysis
+            .intervals
+            .iter()
+            .filter(|i| &i.provider == provider && i.window == window)
+        {
+            match i.dominant() {
+                Some((_, share)) if share >= DOMINANT_SHARE => attributed += i.total_weighted,
+                _ => mixed += i.total_weighted,
+            }
+        }
+        (attributed, mixed)
+    }
+
+    fn single_model_intervals<'a>(
+        &'a self,
+        provider: &'a Provider,
+        model: &'a str,
+        window: Window,
+    ) -> impl Iterator<Item = &'a crate::analysis::Interval> {
+        self.analysis.intervals.iter().filter(move |i| {
+            &i.provider == provider
+                && i.window == window
+                && i.total_weighted > 0.0
+                && matches!(i.dominant(), Some((m, share)) if m == model && share >= DOMINANT_SHARE)
+        })
     }
 }

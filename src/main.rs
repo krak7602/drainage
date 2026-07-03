@@ -97,41 +97,55 @@ fn scan() -> Result<()> {
 
     println!("token spend by model (weighted = input·1 + output·5 + cache_write·1.25 + cache_read·0)");
     println!(
-        "  {:<12} {:<28} {:>10} {:>10} {:>10} {:>8} {:>10}",
-        "harness", "model", "raw", "output", "weighted", "calls", "5h %/Mtok"
+        "  {:<12} {:<24} {:>10} {:>10} {:>10} {:>8}",
+        "harness", "model", "raw", "output", "weighted", "calls"
     );
     for r in d.by_model() {
-        let rate = r.rate_5h.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into());
         println!(
-            "  {:<12} {:<28} {:>10} {:>10} {:>10} {:>8} {:>10}",
+            "  {:<12} {:<24} {:>10} {:>10} {:>10} {:>8}",
             r.harness.to_string(),
-            truncate(&r.model, 28),
+            truncate(&r.model, 24),
             human(r.raw as f64),
             human(r.output as f64),
             human(r.weighted),
             r.calls,
-            rate
         );
     }
     println!();
 
-    println!("exchange rate  (Δ window-% consumed per 1M weighted tokens, scoped per account)");
+    println!("exchange rate PER MODEL  (Δ window-% per 1M weighted tokens; cache-reads excluded)");
     let mut any = false;
     for provider in d.providers() {
         for window in [Window::FiveHour, Window::SevenDay] {
-            if let Some(med) = d.median_rate(&provider, window) {
-                any = true;
-                let drift = d
-                    .drift_summary(&provider, window)
-                    .map(|(r, o, c)| format!("   drift: {o:.2} → {r:.2} ({c:+.0}%)"))
-                    .unwrap_or_default();
-                println!("  {provider} [{}]: median {med:.3} %/Mtok{drift}", window.label());
+            let mut header_done = false;
+            for model in d.models(&provider) {
+                if let Some((rate, n)) = d.model_rate(&provider, &model, window) {
+                    any = true;
+                    if !header_done {
+                        println!("  {provider} [{}]:", window.label());
+                        header_done = true;
+                    }
+                    let drift = d
+                        .model_drift_summary(&provider, &model, window)
+                        .map(|(r, o, c)| format!("   drift {o:.2}→{r:.2} ({c:+.0}%)"))
+                        .unwrap_or_default();
+                    println!("      {:<22} {rate:>7.2} %/Mtok  (n={n}){drift}", truncate(&model, 22));
+                }
+            }
+            if header_done {
+                let (attr, mixed) = d.attribution_coverage(&provider, window);
+                if attr + mixed > 0.0 && mixed > 0.0 {
+                    println!(
+                        "      unattributed: {:.0}% of spend in mixed-model intervals (priced later via NNLS)",
+                        mixed / (attr + mixed) * 100.0
+                    );
+                }
             }
         }
     }
     if !any {
-        println!("  no measurable intervals yet — collector just started.");
-        println!("  Claude utilization cannot be backfilled; keep using Claude Code and it fills in.");
+        println!("  no per-model rates yet — collector just started.");
+        println!("  Claude utilization can't be backfilled; keep using your agents and it fills in.");
     }
     if d.analysis.decayed_skipped > 0 {
         println!(

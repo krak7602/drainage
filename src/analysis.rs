@@ -1,16 +1,21 @@
 //! The core measurement: how much of a rate-limit window a token actually costs,
-//! and how that "exchange rate" drifts over time.
+//! per model, and how that "exchange rate" drifts over time.
 //!
-//! Method: between two consecutive utilization snapshots, the window's used-%
-//! moved by Δpct. We attribute that to the (weighted) tokens spent in the same
-//! interval and report Δpct per 1M weighted tokens. We only trust intervals
-//! where Δpct > 0 (the window was filling, not decaying), and we segment by
-//! model so that a shift in model mix or cache-hit rate doesn't masquerade as
-//! genuine rate drift.
+//! The exchange rate is intrinsically PER MODEL — Opus consumes far more of a
+//! window per token than Sonnet, so a rate pooled across models just measures
+//! your model mix, not anything real. So every `Interval` stores its full
+//! per-model token vector (the regression "design row") alongside the observed
+//! Δ%. Stage 1 attributes single-model-dominant intervals directly; later stages
+//! (NNLS over windows, then a Kalman filter) consume the same rows to decompose
+//! mixed intervals — no rework needed.
 
 use crate::model::{Provider, TokenEvent, UtilSnapshot, Weights};
 use chrono::{TimeZone, Utc};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// A model must be at least this share of an interval's (weighted) spend to be
+/// credited with that interval's Δ% under stage-1 single-model attribution.
+pub const DOMINANT_SHARE: f64 = 0.9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
@@ -25,48 +30,48 @@ impl Window {
             Window::SevenDay => "7d",
         }
     }
+    pub fn other(&self) -> Window {
+        match self {
+            Window::FiveHour => Window::SevenDay,
+            Window::SevenDay => Window::FiveHour,
+        }
+    }
 }
 
-/// One measured exchange-rate observation over a time interval.
-/// Some fields are kept for inspection/future detail views, not all are read yet.
+/// One window's movement over one inter-snapshot interval, with the per-model
+/// weighted-token breakdown that (plus unobserved account-global usage) produced
+/// it. `tokens_by_model` × unknown per-model rates ≈ `delta_pct` is the
+/// regression the later stages solve.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Interval {
     pub provider: Provider,
     pub window: Window,
-    pub t0: i64,
     pub t1: i64,
     pub delta_pct: f64,
-    pub weighted: f64,
-    pub raw: u64,
-    pub output: u64,
-    pub dominant_model: String,
-    /// Δpct per 1M weighted tokens — the exchange rate.
-    pub rate_per_mtok: f64,
+    /// (model, weighted tokens) — weighted excludes cache-reads (weight 0), which
+    /// are ~free against the limit, so a cache-heavy session isn't mispriced.
+    pub tokens_by_model: Vec<(String, f64)>,
+    pub total_weighted: f64,
+}
+
+impl Interval {
+    /// The model with the largest share of this interval's spend, and its share.
+    pub fn dominant(&self) -> Option<(&str, f64)> {
+        if self.total_weighted <= 0.0 {
+            return None;
+        }
+        let best = self
+            .tokens_by_model
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())?;
+        Some((best.0.as_str(), best.1 / self.total_weighted))
+    }
 }
 
 pub struct Analysis {
     pub intervals: Vec<Interval>,
     /// Intervals skipped because the window decayed (Δpct ≤ 0) despite spend.
     pub decayed_skipped: usize,
-}
-
-fn dominant(events: &[&TokenEvent], w: &Weights) -> (String, f64) {
-    use std::collections::HashMap;
-    let mut by_model: HashMap<&str, f64> = HashMap::new();
-    let mut total = 0.0;
-    for e in events {
-        let wt = e.weighted(w);
-        *by_model.entry(e.model.as_str()).or_default() += wt;
-        total += wt;
-    }
-    let best = by_model
-        .into_iter()
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-    match best {
-        Some((m, wt)) if total > 0.0 && wt / total >= 0.8 => (m.to_string(), total),
-        _ => ("mixed".to_string(), total),
-    }
 }
 
 pub fn analyze(events: &[TokenEvent], snaps: &[UtilSnapshot], w: &Weights) -> Analysis {
@@ -83,17 +88,22 @@ pub fn analyze(events: &[TokenEvent], snaps: &[UtilSnapshot], w: &Weights) -> An
             if s1.ts <= s0.ts {
                 continue;
             }
-            let in_interval: Vec<&TokenEvent> = events
+            let evs: Vec<&TokenEvent> = events
                 .iter()
                 .filter(|e| e.provider == provider && e.ts > s0.ts && e.ts <= s1.ts)
                 .collect();
-            if in_interval.is_empty() {
+            if evs.is_empty() {
                 continue;
             }
-            let weighted: f64 = in_interval.iter().map(|e| e.weighted(w)).sum();
-            let raw: u64 = in_interval.iter().map(|e| e.raw_total()).sum();
-            let output: u64 = in_interval.iter().map(|e| e.output).sum();
-            let (model, _) = dominant(&in_interval, w);
+            let mut by_model: BTreeMap<String, f64> = BTreeMap::new();
+            for e in &evs {
+                *by_model.entry(e.model.clone()).or_default() += e.weighted(w);
+            }
+            let total_weighted: f64 = by_model.values().sum();
+            if total_weighted <= 0.0 {
+                continue;
+            }
+            let tokens_by_model: Vec<(String, f64)> = by_model.into_iter().collect();
 
             for (window, p0, p1) in [
                 (Window::FiveHour, s0.five_pct, s1.five_pct),
@@ -107,20 +117,13 @@ pub fn analyze(events: &[TokenEvent], snaps: &[UtilSnapshot], w: &Weights) -> An
                     decayed_skipped += 1;
                     continue;
                 }
-                if weighted <= 0.0 {
-                    continue;
-                }
                 intervals.push(Interval {
                     provider: provider.clone(),
                     window,
-                    t0: s0.ts,
                     t1: s1.ts,
                     delta_pct: delta,
-                    weighted,
-                    raw,
-                    output,
-                    dominant_model: model.clone(),
-                    rate_per_mtok: delta / (weighted / 1_000_000.0),
+                    tokens_by_model: tokens_by_model.clone(),
+                    total_weighted,
                 });
             }
         }
