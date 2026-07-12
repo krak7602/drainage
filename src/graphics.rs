@@ -42,24 +42,19 @@ impl Charts {
         Self { picker: None }
     }
 
-    pub fn enabled(&self) -> bool {
-        self.picker.is_some()
-    }
-
     pub fn picker(&self) -> Option<&Picker> {
         self.picker.as_ref()
     }
 }
 
-const W: u32 = 1400;
-const H: u32 = 520;
 const ML: u32 = 8;
 const MR: u32 = 8;
-const MT: u32 = 10;
-const MB: u32 = 10;
+const MT: u32 = 12;
+const MB: u32 = 12;
 
 fn blend(img: &mut RgbaImage, x: i64, y: i64, c: (u8, u8, u8), a: f64) {
-    if x < 0 || y < 0 || x >= W as i64 || y >= H as i64 {
+    let (iw, ih) = img.dimensions();
+    if x < 0 || y < 0 || x >= iw as i64 || y >= ih as i64 {
         return;
     }
     let p = img.get_pixel_mut(x as u32, y as u32);
@@ -77,11 +72,12 @@ fn disk(img: &mut RgbaImage, x: i64, y: i64, c: (u8, u8, u8), r: i64) {
     }
 }
 
-/// Render per-model drift lines to an image. `series` is (rgb, points) where
-/// points are (x=unix seconds, y=rate). ratatui draws the title/legend around.
-pub fn render_drift(series: &[RgbSeries]) -> DynamicImage {
+/// Render per-model drift lines to an image of the given pixel size (matched to
+/// the pane so it fills crisply). `series` is (rgb, points) where points are
+/// (x=unix seconds, y=rate). ratatui draws the title/legend around it.
+pub fn render_drift(series: &[RgbSeries], w: u32, h: u32) -> DynamicImage {
     let bg = (24, 24, 28);
-    let mut img = RgbaImage::from_pixel(W, H, Rgba([bg.0, bg.1, bg.2, 255]));
+    let mut img = RgbaImage::from_pixel(w, h, Rgba([bg.0, bg.1, bg.2, 255]));
 
     // Data bounds.
     let (mut xmin, mut xmax, mut ymax) = (f64::INFINITY, f64::NEG_INFINITY, 1.0f64);
@@ -97,58 +93,53 @@ pub fn render_drift(series: &[RgbSeries]) -> DynamicImage {
     }
     ymax *= 1.15;
 
-    let px = |x: f64| -> i64 {
-        (ML as f64 + (x - xmin) / (xmax - xmin) * (W - ML - MR) as f64).round() as i64
-    };
-    let py = |y: f64| -> i64 {
-        ((H - MB) as f64 - (y / ymax) * (H - MT - MB) as f64).round() as i64
-    };
+    let px =
+        |x: f64| -> i64 { (ML as f64 + (x - xmin) / (xmax - xmin) * (w - ML - MR) as f64).round() as i64 };
+    let py =
+        |y: f64| -> i64 { ((h - MB) as f64 - (y / ymax) * (h - MT - MB) as f64).round() as i64 };
 
     // Horizontal gridlines at 25% steps.
     for i in 0..=4 {
         let y = py(ymax * i as f64 / 4.0);
-        for x in ML as i64..(W - MR) as i64 {
+        for x in ML as i64..(w - MR) as i64 {
             blend(&mut img, x, y, (70, 70, 78), 0.5);
         }
     }
 
+    let lw = (h / 200).clamp(1, 4) as i64; // line thickness scales with size
     for (rgb, pts) in series {
         if pts.len() < 2 {
-            // A single point: draw a dot so it's still visible.
             if let Some(&(x, y)) = pts.first() {
-                disk(&mut img, px(x), py(y), *rgb, 3);
+                disk(&mut img, px(x), py(y), *rgb, lw + 1);
             }
             continue;
         }
-        // Area fill (translucent) then the line on top.
-        for w in pts.windows(2) {
-            let (x0, y0) = w[0];
-            let (x1, y1) = w[1];
-            let (a, b) = (px(x0), px(x1));
+        // Area fill (translucent) under the line.
+        let base = (h - MB) as i64;
+        for seg in pts.windows(2) {
+            let (a, b) = (px(seg[0].0), px(seg[1].0));
             let steps = (b - a).abs().max(1);
             for s in 0..=steps {
                 let t = s as f64 / steps as f64;
                 let x = a + (b - a) * s / steps;
-                let yv = y0 + (y1 - y0) * t;
-                let yp = py(yv);
-                for yy in yp..(H - MB) as i64 {
-                    blend(&mut img, x, yy, *rgb, 0.06);
+                let yp = py(seg[0].1 + (seg[1].1 - seg[0].1) * t);
+                for yy in yp..base {
+                    blend(&mut img, x, yy, *rgb, 0.07);
                 }
             }
         }
-        // Thick polyline.
-        for w in pts.windows(2) {
-            let (p0, p1) = ((px(w[0].0), py(w[0].1)), (px(w[1].0), py(w[1].1)));
-            let steps = ((p1.0 - p0.0).abs()).max((p1.1 - p0.1).abs()).max(1);
+        // Thick polyline on top.
+        for seg in pts.windows(2) {
+            let (p0, p1) = ((px(seg[0].0), py(seg[0].1)), (px(seg[1].0), py(seg[1].1)));
+            let steps = (p1.0 - p0.0).abs().max((p1.1 - p0.1).abs()).max(1);
             for s in 0..=steps {
                 let x = p0.0 + (p1.0 - p0.0) * s / steps;
                 let y = p0.1 + (p1.1 - p0.1) * s / steps;
-                disk(&mut img, x, y, *rgb, 2);
+                disk(&mut img, x, y, *rgb, lw);
             }
         }
-        // Emphasize the latest point.
         if let Some(&(x, y)) = pts.last() {
-            disk(&mut img, px(x), py(y), *rgb, 3);
+            disk(&mut img, px(x), py(y), *rgb, lw + 1);
         }
     }
 
@@ -166,13 +157,13 @@ mod tests {
             ((210, 110, 210), vec![(0.0, 5.0), (2.0, 8.0)]),
             ((220, 200, 90), vec![(1.0, 3.0)]), // single point
         ];
-        let img = render_drift(&series);
-        assert_eq!(img.width(), W);
-        assert_eq!(img.height(), H);
+        let img = render_drift(&series, 1400, 520);
+        assert_eq!(img.width(), 1400);
+        assert_eq!(img.height(), 520);
     }
 
     #[test]
     fn empty_series_ok() {
-        assert_eq!(render_drift(&[]).width(), W);
+        assert_eq!(render_drift(&[], 800, 400).width(), 800);
     }
 }

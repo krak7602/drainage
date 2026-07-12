@@ -18,7 +18,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::StatefulImage;
+use ratatui_image::{Resize, StatefulImage};
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
@@ -325,24 +325,28 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(Line::from(title_spans));
 
     // High-fidelity path: rasterized chart via the terminal graphics protocol.
-    if app.charts.enabled() {
+    if let Some(picker) = app.charts.picker() {
         let img_series: Vec<crate::graphics::RgbSeries> = series
             .iter()
             .enumerate()
             .map(|(idx, ms)| (crate::graphics::RGB_PALETTE[idx % 6], ms.2.clone()))
             .collect();
-        let sig = drift_sig(app.tab, win, app.method, &img_series);
         let inner = block.inner(rows[1]);
         f.render_widget(block, rows[1]);
+        // Render the image at the pane's pixel size so it fills crisply.
+        let fs = picker.font_size();
+        let w_px = ((inner.width as u32) * fs.width as u32).clamp(200, 2600);
+        let h_px = ((inner.height as u32) * fs.height as u32).clamp(120, 1500);
+        let sig = drift_sig(app.tab, win, app.method, &img_series)
+            ^ (w_px as u64).wrapping_mul(2654435761)
+            ^ (h_px as u64).wrapping_mul(40503);
         let mut cache = app.drift_img.borrow_mut();
         if cache.as_ref().map(|(s, _)| *s) != Some(sig) {
-            if let Some(picker) = app.charts.picker() {
-                let dynimg = crate::graphics::render_drift(&img_series);
-                *cache = Some((sig, picker.new_resize_protocol(dynimg)));
-            }
+            let dynimg = crate::graphics::render_drift(&img_series, w_px, h_px);
+            *cache = Some((sig, picker.new_resize_protocol(dynimg)));
         }
         if let Some((_, proto)) = cache.as_mut() {
-            f.render_stateful_widget(StatefulImage::default(), inner, proto);
+            f.render_stateful_widget(StatefulImage::default().resize(Resize::Scale(None)), inner, proto);
         }
         return;
     }
