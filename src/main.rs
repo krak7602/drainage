@@ -2,6 +2,7 @@ mod analysis;
 mod clock;
 mod collect;
 mod data;
+mod graphics;
 mod levels;
 mod model;
 mod sources;

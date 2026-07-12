@@ -18,6 +18,8 @@ walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.30"
 rusqlite = { version = "0.32", features = ["bundled"] }
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+image = { version = "0.25.10", default-features = false }
 
 [profile.release]
 opt-level = 2

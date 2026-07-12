@@ -17,6 +17,9 @@ use ratatui::widgets::{
     Table, Tabs,
 };
 use ratatui::Frame;
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::StatefulImage;
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 const RELOAD_EVERY: Duration = Duration::from_secs(3);
@@ -39,12 +42,18 @@ struct App {
     tab: usize,
     window: Window,
     method: Method,
+    charts: crate::graphics::Charts,
+    /// Cached image protocol for the drift chart (rebuilt when data changes).
+    drift_img: RefCell<Option<(u64, StatefulProtocol)>>,
     last_reload: Instant,
     loaded_ago: Instant,
 }
 
 pub fn run() -> Result<()> {
     let data = Data::load(Weights::default())?;
+    let mut terminal = ratatui::init();
+    // Query the terminal for a graphics protocol (after raw mode is on).
+    let charts = crate::graphics::Charts::init();
     let mut app = App {
         data,
         tab: 0,
@@ -52,11 +61,12 @@ pub fn run() -> Result<()> {
         // the strongest signal; levels+Kalman is the most accurate estimator.
         window: Window::FiveHour,
         method: Method::Levels,
+        charts,
+        drift_img: RefCell::new(None),
         last_reload: Instant::now(),
         loaded_ago: Instant::now(),
     };
 
-    let mut terminal = ratatui::init();
     let res = loop {
         if let Err(e) = terminal.draw(|f| draw(f, &app)) {
             break Err(e.into());
@@ -307,6 +317,36 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Colored model-name legend on the border, shared by both render paths.
+    let mut title_spans = vec![Span::raw(format!(" drift · {} · ", win.label()))];
+    for (name, color, _) in &series {
+        title_spans.push(Span::styled(format!("{name} "), Style::new().fg(*color)));
+    }
+    let block = Block::default().borders(Borders::ALL).title(Line::from(title_spans));
+
+    // High-fidelity path: rasterized chart via the terminal graphics protocol.
+    if app.charts.enabled() {
+        let img_series: Vec<crate::graphics::RgbSeries> = series
+            .iter()
+            .enumerate()
+            .map(|(idx, ms)| (crate::graphics::RGB_PALETTE[idx % 6], ms.2.clone()))
+            .collect();
+        let sig = drift_sig(app.tab, win, app.method, &img_series);
+        let inner = block.inner(rows[1]);
+        f.render_widget(block, rows[1]);
+        let mut cache = app.drift_img.borrow_mut();
+        if cache.as_ref().map(|(s, _)| *s) != Some(sig) {
+            if let Some(picker) = app.charts.picker() {
+                let dynimg = crate::graphics::render_drift(&img_series);
+                *cache = Some((sig, picker.new_resize_protocol(dynimg)));
+            }
+        }
+        if let Some((_, proto)) = cache.as_mut() {
+            f.render_stateful_widget(StatefulImage::default(), inner, proto);
+        }
+        return;
+    }
+
     let xs: Vec<f64> = series.iter().flat_map(|(_, _, s)| s.iter().map(|p| p.0)).collect();
     let ys: Vec<f64> = series.iter().flat_map(|(_, _, s)| s.iter().map(|p| p.1)).collect();
     let xmin = xs.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -328,11 +368,7 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" exchange-rate over time · {} (%/Mtok, per model) ", win.label())),
-        )
+        .block(block)
         .x_axis(
             Axis::default()
                 .style(Style::new().fg(Color::DarkGray))
@@ -354,6 +390,35 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
                 ]),
         );
     f.render_widget(chart, rows[1]);
+}
+
+/// Cheap change-signature so we only re-encode the drift image when it changes.
+fn drift_sig(tab: usize, win: Window, method: Method, series: &[crate::graphics::RgbSeries]) -> u64 {
+    let mut vals: Vec<u64> = vec![
+        tab as u64,
+        match win {
+            Window::FiveHour => 5,
+            Window::SevenDay => 7,
+        },
+        match method {
+            Method::Single => 1,
+            Method::Nnls => 2,
+            Method::Levels => 3,
+        },
+    ];
+    for (_, pts) in series {
+        vals.push(pts.len() as u64);
+        if let Some(&(x, y)) = pts.last() {
+            vals.push(x as u64);
+            vals.push((y * 1000.0) as i64 as u64);
+        }
+    }
+    let mut h: u64 = 1469598103934665603;
+    for v in vals {
+        h ^= v;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h
 }
 
 fn draw_attr(f: &mut Frame, app: &App, area: Rect) {
@@ -684,6 +749,8 @@ mod tests {
             tab: 0,
             window: Window::SevenDay,
             method: Method::Single,
+            charts: crate::graphics::Charts::disabled(),
+            drift_img: RefCell::new(None),
             last_reload: Instant::now(),
             loaded_ago: Instant::now(),
         };
