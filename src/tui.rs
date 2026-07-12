@@ -9,7 +9,7 @@ use crate::model::{Provider, Weights};
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -321,7 +321,7 @@ fn draw_drift(f: &mut Frame, app: &App, area: Rect) {
         .map(|(name, color, s)| {
             ChartDataset::default()
                 .name(name.clone())
-                .marker(Marker::Braille)
+                .marker(Marker::Octant)
                 .graph_type(GraphType::Line)
                 .style(Style::new().fg(*color))
                 .data(s)
@@ -364,8 +364,9 @@ fn draw_attr(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .filter_map(|r| est_of(r).map(|e| e.rate))
         .fold(0.0_f64, f64::max);
+    let max_weighted = rows.first().map(|r| r.weighted).unwrap_or(1.0).max(1.0);
 
-    let header = Row::new(vec!["harness", "model", "weighted", "%/Mtok", "conf"])
+    let header = Row::new(vec!["harness", "model", "weighted spend", "%/Mtok", "conf"])
         .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     let body: Vec<Row> = rows
         .iter()
@@ -377,15 +378,22 @@ fn draw_attr(f: &mut Frame, app: &App, area: Rect) {
                 .as_ref()
                 .map(|e| conf_glyph(e.confidence()))
                 .unwrap_or(("", Color::DarkGray));
-            let style = if rate.map(|v| v >= max_rate && max_rate > 0.0).unwrap_or(false) {
+            let hot = rate.map(|v| v >= max_rate && max_rate > 0.0).unwrap_or(false);
+            let style = if hot {
                 Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
             };
+            // Number + sub-cell bar for weighted spend.
+            let bar = hbar(r.weighted / max_weighted, 10);
+            let spend = Line::from(vec![
+                Span::raw(format!("{:>8} ", human(r.weighted))),
+                Span::styled(bar, Style::new().fg(Color::Indexed(24))),
+            ]);
             Row::new(vec![
                 Cell::from(r.harness.to_string()),
                 Cell::from(short_model(&r.model)),
-                Cell::from(human(r.weighted)),
+                Cell::from(spend),
                 Cell::from(rate_s),
                 Cell::from(Span::styled(glyph, Style::new().fg(gc))),
             ])
@@ -397,8 +405,8 @@ fn draw_attr(f: &mut Frame, app: &App, area: Rect) {
         body,
         [
             Constraint::Length(12),
-            Constraint::Min(16),
-            Constraint::Length(12),
+            Constraint::Min(14),
+            Constraint::Length(21),
             Constraint::Length(9),
             Constraint::Length(6),
         ],
@@ -505,6 +513,33 @@ fn draw_budget(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Horizontal bar with 1/8-cell precision, `width` cells wide.
+fn hbar(frac: f64, width: usize) -> String {
+    let eighths = (frac.clamp(0.0, 1.0) * width as f64 * 8.0).round() as usize;
+    let rem = eighths % 8;
+    let mut s = "█".repeat(eighths / 8);
+    if !eighths.is_multiple_of(8) {
+        s.push(['▏', '▎', '▍', '▌', '▋', '▊', '▉'][rem - 1]);
+    }
+    s
+}
+
+fn lerp(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
+    let m = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * t).round() as u8;
+    (m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
+}
+
+/// Green (slower/cheaper) → yellow → red (faster) by relative multiplier.
+fn heat_color(rel: f64) -> Color {
+    let t = ((rel - 0.7) / 0.6).clamp(0.0, 1.0);
+    let (r, g, b) = if t < 0.5 {
+        lerp((70, 180, 95), (215, 195, 70), t / 0.5)
+    } else {
+        lerp((215, 195, 70), (220, 80, 60), (t - 0.5) / 0.5)
+    };
+    Color::Rgb(r, g, b)
+}
+
 fn rel_style(rel: f64) -> (Color, &'static str) {
     if rel > 1.12 {
         (Color::Red, "faster")
@@ -583,28 +618,53 @@ fn draw_clock(f: &mut Frame, app: &App, area: Rect) {
         rows[0],
     );
 
-    let mut hlines = Vec::new();
-    for h in 0..24u32 {
-        if let Some(xs) = by_hour.get(&h) {
-            if !xs.is_empty() {
-                let mut v = xs.clone();
-                let rel = crate::analysis::median(&mut v) / baseline;
-                let (col, _) = rel_style(rel);
-                let bar = "█".repeat(((rel * 12.0).round() as usize).min(40));
-                hlines.push(Line::from(vec![
-                    Span::raw(format!("  {h:02}:00 ")),
-                    Span::styled(format!("{rel:>5.2}x "), Style::new().fg(col)),
-                    Span::styled(bar, Style::new().fg(col)),
-                    Span::styled(format!("  ({})", xs.len()), Style::new().fg(Color::DarkGray)),
-                ]));
-            }
-        }
-    }
+    // 24-hour heatmap band: each hour a gradient cell (green slower → red faster).
+    let cell_w = ((rows[1].width.saturating_sub(2) as usize) / 24).clamp(2, 6);
+    let empty = Color::Rgb(38, 38, 42);
+    let rel_at = |h: u32| -> Option<f64> {
+        by_hour.get(&h).filter(|xs| !xs.is_empty()).map(|xs| {
+            let mut v = xs.clone();
+            crate::analysis::median(&mut v) / baseline
+        })
+    };
+    let band_row = || {
+        let spans: Vec<Span> = (0..24u32)
+            .map(|h| {
+                let bg = rel_at(h).map(heat_color).unwrap_or(empty);
+                Span::styled(" ".repeat(cell_w), Style::new().bg(bg))
+            })
+            .collect();
+        Line::from(spans)
+    };
+    let label_row = Line::from(
+        (0..24u32)
+            .map(|h| {
+                let s = if h % 6 == 0 {
+                    format!("{:<w$}", format!("{h:02}"), w = cell_w)
+                } else {
+                    " ".repeat(cell_w)
+                };
+                Span::styled(s, Style::new().fg(Color::DarkGray))
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let mut lines = vec![Line::from(""), band_row(), band_row(), band_row(), label_row];
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("  ", Style::new().bg(heat_color(0.75))),
+        Span::raw(" slower / more usage per token      "),
+        Span::styled("  ", Style::new().bg(heat_color(1.25))),
+        Span::raw(" faster burn      "),
+        Span::styled("  ", Style::new().bg(empty)),
+        Span::raw(" no data"),
+    ]));
     f.render_widget(
-        Paragraph::new(hlines).block(
+        Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" hourly (rel to your average · red = faster, green = slower) "),
+                .title(" hourly heatmap (local time, 00–23) "),
         ),
         rows[1],
     );
