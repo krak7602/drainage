@@ -52,6 +52,21 @@ const MR: u32 = 8;
 const MT: u32 = 12;
 const MB: u32 = 12;
 
+fn lerp(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
+    let m = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * t).round() as u8;
+    (m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
+}
+
+/// Green (slower/cheaper) → yellow → red (faster) by relative multiplier.
+pub fn heat_rgb(rel: f64) -> (u8, u8, u8) {
+    let t = ((rel - 0.7) / 0.6).clamp(0.0, 1.0);
+    if t < 0.5 {
+        lerp((70, 180, 95), (215, 195, 70), t / 0.5)
+    } else {
+        lerp((215, 195, 70), (220, 80, 60), (t - 0.5) / 0.5)
+    }
+}
+
 fn blend(img: &mut RgbaImage, x: i64, y: i64, c: (u8, u8, u8), a: f64) {
     let (iw, ih) = img.dimensions();
     if x < 0 || y < 0 || x >= iw as i64 || y >= ih as i64 {
@@ -146,9 +161,73 @@ pub fn render_drift(series: &[RgbSeries], w: u32, h: u32) -> DynamicImage {
     DynamicImage::ImageRgba8(img)
 }
 
+/// Render the 24-hour time-of-day heatmap: gradient columns (green→red by the
+/// mix-adjusted multiplier) with a white value curve and a rel=1 baseline.
+/// `rels` is length 24 (index = local hour); None = no data that hour.
+pub fn render_hour_strip(rels: &[Option<f64>], w: u32, h: u32) -> DynamicImage {
+    let mut img = RgbaImage::from_pixel(w, h, Rgba([24, 24, 28, 255]));
+    let vals: Vec<f64> = rels.iter().filter_map(|r| *r).collect();
+    if vals.is_empty() {
+        return DynamicImage::ImageRgba8(img);
+    }
+    let colw = w as f64 / 24.0;
+    let dmin = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let dmax = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let rmin = dmin.min(0.7) * 0.98;
+    let rmax = (dmax.max(1.3) * 1.02).max(rmin + 0.1);
+    let py = |r: f64| ((h - MB) as f64 - (r - rmin) / (rmax - rmin) * (h - MT - MB) as f64).round() as i64;
+
+    // Gradient columns.
+    for (i, rel) in rels.iter().enumerate().take(24) {
+        let x0 = (i as f64 * colw).round() as i64;
+        let x1 = ((i + 1) as f64 * colw).round() as i64;
+        let c = rel.map(heat_rgb).unwrap_or((44, 44, 50));
+        for x in x0..x1 {
+            for y in 0..h as i64 {
+                blend(&mut img, x, y, c, 1.0);
+            }
+        }
+    }
+    // Dashed baseline at rel = 1.
+    let yb = py(1.0);
+    let mut x = 0i64;
+    while x < w as i64 {
+        for dx in 0..8 {
+            blend(&mut img, x + dx, yb, (210, 210, 220), 0.45);
+        }
+        x += 16;
+    }
+    // White value curve.
+    let lw = (h / 160).clamp(1, 3) as i64;
+    let pts: Vec<(i64, i64)> = (0..24)
+        .filter_map(|i| rels[i].map(|r| ((i as f64 * colw + colw / 2.0) as i64, py(r))))
+        .collect();
+    for seg in pts.windows(2) {
+        let (p0, p1) = (seg[0], seg[1]);
+        let steps = (p1.0 - p0.0).abs().max((p1.1 - p0.1).abs()).max(1);
+        for s in 0..=steps {
+            let x = p0.0 + (p1.0 - p0.0) * s / steps;
+            let y = p0.1 + (p1.1 - p0.1) * s / steps;
+            disk(&mut img, x, y, (235, 235, 240), lw);
+        }
+    }
+    for p in &pts {
+        disk(&mut img, p.0, p.1, (255, 255, 255), lw);
+    }
+    DynamicImage::ImageRgba8(img)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renders_hour_strip_ok() {
+        let rels: Vec<Option<f64>> = (0..24)
+            .map(|i| if i % 3 == 0 { None } else { Some(0.8 + (i as f64) * 0.02) })
+            .collect();
+        assert_eq!(render_hour_strip(&rels, 1200, 300).width(), 1200);
+    }
 
     #[test]
     fn renders_drift_without_panic() {

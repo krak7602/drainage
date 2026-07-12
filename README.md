@@ -16,6 +16,10 @@ Estimates carry a confidence glyph (●●● / ●●○ / ●○○) from samp
 uncertainty, and the levels estimate shows ±σ, so you can see how much to trust
 a number while data is still thin.
 
+In terminals that support a graphics protocol (Kitty / iTerm2 / Sixel — e.g.
+Ghostty, WezTerm, Kitty), the Drift and Clock charts render as real rasterized
+images; elsewhere they fall back to smooth Unicode (Octant/heatmap) charts.
+
 ## Why this is hard (and how drainage does it)
 
 You need two signals joined over time:

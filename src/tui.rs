@@ -43,8 +43,9 @@ struct App {
     window: Window,
     method: Method,
     charts: crate::graphics::Charts,
-    /// Cached image protocol for the drift chart (rebuilt when data changes).
+    /// Cached image protocols (rebuilt only when the underlying data changes).
     drift_img: RefCell<Option<(u64, StatefulProtocol)>>,
+    clock_img: RefCell<Option<(u64, StatefulProtocol)>>,
     last_reload: Instant,
     loaded_ago: Instant,
 }
@@ -63,6 +64,7 @@ pub fn run() -> Result<()> {
         method: Method::Levels,
         charts,
         drift_img: RefCell::new(None),
+        clock_img: RefCell::new(None),
         last_reload: Instant::now(),
         loaded_ago: Instant::now(),
     };
@@ -593,19 +595,9 @@ fn hbar(frac: f64, width: usize) -> String {
     s
 }
 
-fn lerp(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
-    let m = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * t).round() as u8;
-    (m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
-}
-
 /// Green (slower/cheaper) → yellow → red (faster) by relative multiplier.
 fn heat_color(rel: f64) -> Color {
-    let t = ((rel - 0.7) / 0.6).clamp(0.0, 1.0);
-    let (r, g, b) = if t < 0.5 {
-        lerp((70, 180, 95), (215, 195, 70), t / 0.5)
-    } else {
-        lerp((215, 195, 70), (220, 80, 60), (t - 0.5) / 0.5)
-    };
+    let (r, g, b) = crate::graphics::heat_rgb(rel);
     Color::Rgb(r, g, b)
 }
 
@@ -687,6 +679,64 @@ fn draw_clock(f: &mut Frame, app: &App, area: Rect) {
         rows[0],
     );
 
+    let rels: Vec<Option<f64>> = (0..24u32)
+        .map(|h| {
+            by_hour.get(&h).filter(|xs| !xs.is_empty()).map(|xs| {
+                let mut v = xs.clone();
+                crate::analysis::median(&mut v) / baseline
+            })
+        })
+        .collect();
+
+    // Image path: rasterized hour heatmap + value curve.
+    if let Some(picker) = app.charts.picker() {
+        let sub = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(rows[1]);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" hourly heatmap + curve (local time · green slower · red faster) ");
+        let inner = block.inner(sub[0]);
+        f.render_widget(block, sub[0]);
+        let fs = picker.font_size();
+        let w_px = ((inner.width as u32) * fs.width as u32).clamp(200, 2600);
+        let h_px = ((inner.height as u32) * fs.height as u32).clamp(80, 900);
+        let mut sig: u64 = 1469598103934665603;
+        for v in std::iter::once(w_px as u64)
+            .chain(std::iter::once(h_px as u64))
+            .chain(rels.iter().map(|r| r.map(|v| (v * 1000.0) as i64 as u64).unwrap_or(u64::MAX)))
+        {
+            sig ^= v;
+            sig = sig.wrapping_mul(1099511628211);
+        }
+        let mut cache = app.clock_img.borrow_mut();
+        if cache.as_ref().map(|(s, _)| *s) != Some(sig) {
+            let dynimg = crate::graphics::render_hour_strip(&rels, w_px, h_px);
+            *cache = Some((sig, picker.new_resize_protocol(dynimg)));
+        }
+        if let Some((_, proto)) = cache.as_mut() {
+            f.render_stateful_widget(StatefulImage::default().resize(Resize::Scale(None)), inner, proto);
+        }
+        // Hour labels aligned under the image.
+        let width = sub[1].width as usize;
+        let mut label: Vec<char> = vec![' '; width];
+        for hh in [0usize, 3, 6, 9, 12, 15, 18, 21] {
+            let pos = ((hh as f64 / 24.0) * width as f64) as usize;
+            for (k, ch) in format!("{hh:02}").chars().enumerate() {
+                if pos + k < width {
+                    label[pos + k] = ch;
+                }
+            }
+        }
+        let label_str: String = label.into_iter().collect();
+        f.render_widget(
+            Paragraph::new(label_str).style(Style::new().fg(Color::DarkGray)),
+            sub[1],
+        );
+        return;
+    }
+
     // 24-hour heatmap band: each hour a gradient cell (green slower → red faster).
     let cell_w = ((rows[1].width.saturating_sub(2) as usize) / 24).clamp(2, 6);
     let empty = Color::Rgb(38, 38, 42);
@@ -755,6 +805,7 @@ mod tests {
             method: Method::Single,
             charts: crate::graphics::Charts::disabled(),
             drift_img: RefCell::new(None),
+            clock_img: RefCell::new(None),
             last_reload: Instant::now(),
             loaded_ago: Instant::now(),
         };
