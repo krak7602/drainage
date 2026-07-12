@@ -1,4 +1,5 @@
 mod analysis;
+mod clock;
 mod collect;
 mod data;
 mod levels;
@@ -6,7 +7,7 @@ mod model;
 mod sources;
 mod tui;
 
-use analysis::{day_key, Window};
+use analysis::{day_key, median, Window};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use data::{Dataset, Method};
@@ -28,6 +29,8 @@ enum Cmd {
     Scan,
     /// Measure real token-type weights (output vs input vs cache) from your data.
     Calibrate,
+    /// Show how the exchange rate varies by time of day (mix-adjusted).
+    Clock,
     /// Install the drainage collector into your Claude Code statusline.
     Init,
     /// Remove the drainage collector and restore your original statusline.
@@ -43,6 +46,7 @@ fn main() -> Result<()> {
         Cmd::Tui => tui::run(),
         Cmd::Scan => scan(),
         Cmd::Calibrate => calibrate(),
+        Cmd::Clock => clock(),
         Cmd::Init => collect::init(),
         Cmd::Uninstall => collect::uninstall(),
         Cmd::Statusline => collect::statusline(),
@@ -207,6 +211,84 @@ fn calibrate() -> Result<()> {
         println!("weights are relative to input=1. Token types are correlated, so a wobbly");
         println!("coefficient (esp. cache_read) usually means collinearity, not a real cost.");
     }
+    Ok(())
+}
+
+fn clock() -> Result<()> {
+    let d = Dataset::load(Weights::default())?;
+    println!("\x1b[1mdrainage clock\x1b[0m  — exchange rate by time of day (mix-adjusted)");
+    println!("─────────────────────────────────────────────");
+    let Some(provider) = d.providers().into_iter().next() else {
+        println!("no utilization data yet.");
+        return Ok(());
+    };
+    // 5h has far more spans/day than 7d, so it carries the time-of-day signal.
+    let window = Window::FiveHour;
+    let by_hour = d.hour_multipliers(&provider, window);
+    let all: Vec<f64> = by_hour.values().flatten().copied().collect();
+    if all.len() < 6 {
+        println!("not enough data yet to profile time-of-day (need more usage across hours).");
+        return Ok(());
+    }
+    let mut all_sorted = all.clone();
+    let baseline = median(&mut all_sorted); // ≈1 by construction; normalize to it
+    println!(
+        "timezone: local {}   ·   {} measurements   ·   baseline = 1.00 (rel to your own average)\n",
+        clock::local_offset_label(),
+        all.len()
+    );
+
+    // Median relative multiplier for an inclusive hour range.
+    let rel_for = |lo: u32, hi: u32| -> (f64, usize) {
+        let mut v: Vec<f64> = by_hour
+            .iter()
+            .filter(|(h, _)| **h >= lo && **h < hi)
+            .flat_map(|(_, xs)| xs.iter().copied())
+            .collect();
+        let n = v.len();
+        if n == 0 || baseline <= 0.0 {
+            (1.0, 0)
+        } else {
+            (median(&mut v) / baseline, n)
+        }
+    };
+
+    println!("part of day (local)      rel    n");
+    for (lo, hi, name) in [
+        (0u32, 6u32, "00–06  late night"),
+        (6, 12, "06–12  morning"),
+        (12, 18, "12–18  afternoon"),
+        (18, 24, "18–24  evening"),
+    ] {
+        let (rel, n) = rel_for(lo, hi);
+        if n == 0 {
+            println!("  {name:<20} {:>6}  {n:>3}", "—");
+            continue;
+        }
+        let tag = if rel > 1.12 {
+            "burns FASTER"
+        } else if rel < 0.88 {
+            "slower / more usage"
+        } else {
+            ""
+        };
+        let bar = "█".repeat(((rel * 8.0).round() as usize).min(40));
+        println!("  {name:<20} {rel:>5.2}x {n:>3}  {bar} {tag}");
+    }
+
+    println!("\nhourly (rel to baseline):");
+    for h in 0..24u32 {
+        if let Some(xs) = by_hour.get(&h) {
+            if !xs.is_empty() {
+                let mut v = xs.clone();
+                let rel = median(&mut v) / baseline;
+                let bar = "█".repeat(((rel * 8.0).round() as usize).min(40));
+                println!("  {h:02}:00  {rel:>5.2}x  ({:>2})  {bar}", xs.len());
+            }
+        }
+    }
+    println!("\n  rel > 1 = the window drained faster than your model mix alone explains at that hour.");
+    println!("  (mix-adjusted, so it isolates a time effect from which models you happened to run.)");
     Ok(())
 }
 

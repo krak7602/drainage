@@ -69,8 +69,9 @@ pub fn run() -> Result<()> {
                         KeyCode::Char('1') => app.tab = 0,
                         KeyCode::Char('2') => app.tab = 1,
                         KeyCode::Char('3') => app.tab = 2,
-                        KeyCode::Tab | KeyCode::Right => app.tab = (app.tab + 1) % 3,
-                        KeyCode::Left => app.tab = (app.tab + 2) % 3,
+                        KeyCode::Char('4') => app.tab = 3,
+                        KeyCode::Tab | KeyCode::Right => app.tab = (app.tab + 1) % 4,
+                        KeyCode::Left => app.tab = (app.tab + 3) % 4,
                         KeyCode::Char('w') => app.window = app.window.other(),
                         KeyCode::Char('m') => app.method = app.method.toggle(),
                         KeyCode::Char('r') => reload(&mut app),
@@ -169,7 +170,8 @@ fn draw(f: &mut Frame, app: &App) {
     match app.tab {
         0 => draw_drift(f, app, chunks[1]),
         1 => draw_attr(f, app, chunks[1]),
-        _ => draw_budget(f, app, chunks[1]),
+        2 => draw_budget(f, app, chunks[1]),
+        _ => draw_clock(f, app, chunks[1]),
     }
     draw_footer(f, app, chunks[2]);
 }
@@ -188,7 +190,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             app.method.label()
         )),
     ]);
-    let tabs = Tabs::new(vec!["1 Drift", "2 Attribution", "3 Budget"])
+    let tabs = Tabs::new(vec!["1 Drift", "2 Attribution", "3 Budget", "4 Clock"])
         .select(app.tab)
         .style(Style::new().fg(Color::DarkGray))
         .highlight_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
@@ -503,6 +505,111 @@ fn draw_budget(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn rel_style(rel: f64) -> (Color, &'static str) {
+    if rel > 1.12 {
+        (Color::Red, "faster")
+    } else if rel < 0.88 {
+        (Color::Green, "slower")
+    } else {
+        (Color::Yellow, "")
+    }
+}
+
+fn draw_clock(f: &mut Frame, app: &App, area: Rect) {
+    let p = primary(app);
+    let by_hour = app.data.hour_multipliers(&p, app.window);
+    let all: Vec<f64> = by_hour.values().flatten().copied().collect();
+    if all.len() < 6 {
+        f.render_widget(
+            Paragraph::new(format!(
+                "Not enough data yet to profile time of day ({} measurements).\nNeeds usage spread across hours — it fills in as you keep working.",
+                all.len()
+            ))
+            .block(Block::default().borders(Borders::ALL).title(" time of day "))
+            .style(Style::new().fg(Color::DarkGray)),
+            area,
+        );
+        return;
+    }
+    let mut all_sorted = all.clone();
+    let baseline = crate::analysis::median(&mut all_sorted);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .split(area);
+
+    let median_of = |lo: u32, hi: u32| -> Option<(f64, usize)> {
+        let mut v: Vec<f64> = by_hour
+            .iter()
+            .filter(|(h, _)| **h >= lo && **h < hi)
+            .flat_map(|(_, xs)| xs.iter().copied())
+            .collect();
+        let n = v.len();
+        if n == 0 {
+            None
+        } else {
+            Some((crate::analysis::median(&mut v) / baseline, n))
+        }
+    };
+
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "Mix-adjusted rate by time of day  ·  tz {}  ·  {} obs  ·  1.00x = your average",
+            crate::clock::local_offset_label(),
+            all.len()
+        ),
+        Style::new().fg(Color::Gray),
+    ))];
+    for (lo, hi, name) in [
+        (0u32, 6u32, "00–06 late night"),
+        (6, 12, "06–12 morning"),
+        (12, 18, "12–18 afternoon"),
+        (18, 24, "18–24 evening"),
+    ] {
+        if let Some((rel, n)) = median_of(lo, hi) {
+            let (col, tag) = rel_style(rel);
+            let bar = "█".repeat(((rel * 10.0).round() as usize).min(30));
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {name:<18} ")),
+                Span::styled(format!("{rel:>5.2}x ", ), Style::new().fg(col).bold()),
+                Span::styled(bar, Style::new().fg(col)),
+                Span::styled(format!(" {tag} (n={n})"), Style::new().fg(col)),
+            ]));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" part of day ")),
+        rows[0],
+    );
+
+    let mut hlines = Vec::new();
+    for h in 0..24u32 {
+        if let Some(xs) = by_hour.get(&h) {
+            if !xs.is_empty() {
+                let mut v = xs.clone();
+                let rel = crate::analysis::median(&mut v) / baseline;
+                let (col, _) = rel_style(rel);
+                let bar = "█".repeat(((rel * 12.0).round() as usize).min(40));
+                hlines.push(Line::from(vec![
+                    Span::raw(format!("  {h:02}:00 ")),
+                    Span::styled(format!("{rel:>5.2}x "), Style::new().fg(col)),
+                    Span::styled(bar, Style::new().fg(col)),
+                    Span::styled(format!("  ({})", xs.len()), Style::new().fg(Color::DarkGray)),
+                ]));
+            }
+        }
+    }
+    f.render_widget(
+        Paragraph::new(hlines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" hourly (rel to your average · red = faster, green = slower) "),
+        ),
+        rows[1],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,7 +633,7 @@ mod tests {
             app.method = method;
             for w in [Window::FiveHour, Window::SevenDay] {
                 app.window = w;
-                for t in 0..3 {
+                for t in 0..4 {
                     app.tab = t;
                     terminal.draw(|f| draw(f, &app)).expect("draw");
                 }

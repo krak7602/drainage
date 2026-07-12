@@ -7,6 +7,7 @@ Per token, the share of your 5-hour / 7-day limit that gets consumed is **not co
 ```
 drainage           # interactive TUI (Drift · Attribution · Budget)
 drainage scan      # one-shot text report
+drainage clock     # how the rate varies by time of day (mix-adjusted)
 drainage calibrate # measure your real token-type weights from data
 drainage init      # install the collector into your Claude Code statusline
 ```

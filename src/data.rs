@@ -162,6 +162,20 @@ impl Dataset {
         self.snaps.iter().rev().find(|s| &s.provider == provider)
     }
 
+    /// Mix-adjusted rate multipliers bucketed by local hour-of-day (0..23),
+    /// using the levels per-model rates as the mix baseline.
+    pub fn hour_multipliers(&self, provider: &Provider, window: Window) -> BTreeMap<u32, Vec<f64>> {
+        let mut rates: BTreeMap<String, f64> = BTreeMap::new();
+        for m in self.models(provider) {
+            if let Some((r, _)) = self.model_rate(provider, &m, window, Method::Levels) {
+                if r > 0.0 {
+                    rates.insert(m, r);
+                }
+            }
+        }
+        crate::clock::hour_multipliers(&self.events, &self.snaps, provider, window, &rates, &self.weights)
+    }
+
     /// Per-model spend rows for the attribution table, weighted-desc.
     pub fn by_model(&self) -> Vec<ModelRow> {
         let mut acc: BTreeMap<(Harness, String), ModelRow> = BTreeMap::new();

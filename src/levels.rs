@@ -20,19 +20,19 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const FIVE_H_SECS: i64 = 5 * 3600;
 pub const SEVEN_D_SECS: i64 = 7 * 86_400;
 
-fn window_secs(w: Window) -> i64 {
+pub(crate) fn window_secs(w: Window) -> i64 {
     match w {
         Window::FiveHour => FIVE_H_SECS,
         Window::SevenDay => SEVEN_D_SECS,
     }
 }
-fn used(s: &UtilSnapshot, w: Window) -> Option<f64> {
+pub(crate) fn used(s: &UtilSnapshot, w: Window) -> Option<f64> {
     match w {
         Window::FiveHour => s.five_pct,
         Window::SevenDay => s.week_pct,
     }
 }
-fn reset(s: &UtilSnapshot, w: Window) -> Option<i64> {
+pub(crate) fn reset(s: &UtilSnapshot, w: Window) -> Option<i64> {
     match w {
         Window::FiveHour => s.five_reset,
         Window::SevenDay => s.week_reset,
